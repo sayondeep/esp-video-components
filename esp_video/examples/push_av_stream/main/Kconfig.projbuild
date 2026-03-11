@@ -1,0 +1,111 @@
+menu "Example Configuration"
+
+    menu "push_av_server Connection"
+
+        config EXAMPLE_SERVER_HOST
+            string "push_av_server hostname or IP address"
+            default "192.168.1.100"
+            help
+                IP address (or hostname) of the machine running push_av_server.
+                The ESP32 will open HTTPS connections to this host.
+
+        config EXAMPLE_SERVER_PORT
+            int "push_av_server HTTPS port"
+            default 1234
+            range 1 65535
+            help
+                HTTPS port on which push_av_server is listening.
+                Default: 1234
+
+        config EXAMPLE_TRACK_NAME
+            string "CMAF track / representation name"
+            default "video1"
+            help
+                Symbolic name for the video track.
+                Used in CMAF segment URLs:
+                  session_N/<track_name>/segment_NNNN.m4s
+                Must match the TrackName field expected by the server.
+
+    endmenu
+
+    menu "TLS / mTLS"
+
+        config EXAMPLE_USE_MTLS
+            bool "Enable mutual TLS (client certificate)"
+            default n
+            help
+                When enabled, embeds PEM files from main/certs/ and uses
+                them for client authentication with the push_av_server.
+
+                Files required (copy before building):
+                  main/certs/server_root_ca.pem  – server's root CA
+                  main/certs/client_cert.pem      – device certificate
+                  main/certs/client_key.pem        – device private key
+
+                Generate these using the push_av_server API:
+                  curl -k -XPOST https://<PC_IP>:1234/certs/esp32/keypair
+
+                When disabled, a TLS connection without client cert is used.
+                The push_av_server must be started with --no-strict in that
+                case (segments will be accepted but marked with an error).
+
+    endmenu
+
+    menu "Stream Settings"
+
+        config EXAMPLE_FRAMES_PER_SEGMENT
+            int "Frames per CMAF segment"
+            default 30
+            range 5 128
+            help
+                Number of H.264 frames to accumulate before flushing one
+                CMAF media segment and uploading it.
+
+                At 30 fps:
+                  30  frames → ~1 second per segment  (recommended)
+                  60  frames → ~2 seconds per segment
+                  15  frames → ~0.5 seconds per segment (more overhead)
+
+        config EXAMPLE_STREAM_DURATION_SEC
+            int "Stream duration in seconds (0 = run forever)"
+            default 0
+            range 0 86400
+            help
+                Stop streaming after this many seconds.
+                Set to 0 for continuous operation until reset.
+
+    endmenu
+
+    menu "H.264 Encoder"
+
+        config EXAMPLE_H264_I_PERIOD
+            int "I-frame period (frames between keyframes)"
+            default 30
+            range 1 120
+            help
+                Keyframe interval.  Should be <= FRAMES_PER_SEGMENT so that
+                every CMAF segment starts with an IDR frame, enabling random
+                access and DASH seeking.
+
+        config EXAMPLE_H264_BITRATE
+            int "Target bitrate (bps)"
+            default 1000000
+            range 25000 4000000
+            help
+                H.264 target bitrate in bits per second.
+                At 1 Mbps a 1-second CMAF segment is approximately 125 KB,
+                which easily fits within the ESP32-P4 PSRAM budget.
+
+        config EXAMPLE_H264_MIN_QP
+            int "Minimum QP (best quality ceiling)"
+            default 25
+            range 1 51
+
+        config EXAMPLE_H264_MAX_QP
+            int "Maximum QP (worst quality floor)"
+            default 26
+            range 1 51
+
+    endmenu
+
+endmenu
