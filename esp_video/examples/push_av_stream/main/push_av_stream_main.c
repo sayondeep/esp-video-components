@@ -44,6 +44,7 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_timer.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -104,6 +105,13 @@ extern const char client_key_pem_start[]
  * Context
  * ========================================================================= */
 
+/* Queue item for asynchronous segment uploads */
+typedef struct {
+    uint8_t  *data;      /**< Segment data (allocated, caller transfers ownership) */
+    size_t    size;      /**< Segment size in bytes */
+    uint16_t  seg_num;   /**< Segment number for logging */
+} upload_queue_item_t;
+
 typedef struct {
     /* V4L2 capture */
     int      cap_fd;
@@ -121,6 +129,10 @@ typedef struct {
     cmaf_mux_handle_t  mux;
     cmaf_push_handle_t push;
 
+    /* Asynchronous upload queue */
+    QueueHandle_t upload_queue;      /**< FreeRTOS queue for pending segment uploads */
+    TaskHandle_t  upload_task_handle; /**< Handle to the upload task */
+
     /* Decode-time tracking */
     uint64_t segment_base_decode_time; /**< decode time of first frame in current seg */
     uint64_t total_decode_time;        /**< running counter across all frames */
@@ -128,6 +140,7 @@ typedef struct {
     /* Stats */
     uint32_t total_segments;
     int64_t  stream_start_us;
+    bool     upload_task_running;     /**< Flag to signal upload task to exit */
 } push_av_ctx_t;
 
 /* =========================================================================
@@ -445,6 +458,12 @@ static esp_err_t wait_for_idr_and_extract_params(push_av_ctx_t *ctx,
 }
 
 /* =========================================================================
+ * Forward declarations
+ * ========================================================================= */
+
+static void upload_task(void *arg);
+
+/* =========================================================================
  * CMAF / push setup
  * ========================================================================= */
 
@@ -485,11 +504,69 @@ static esp_err_t setup_cmaf(push_av_ctx_t *ctx,
     ESP_RETURN_ON_ERROR(cmaf_push_init(&push_cfg, &ctx->push),
                         TAG, "cmaf_push_init");
 
+    /* Create upload queue (hold up to 5 segments to buffer network delays) */
+    ctx->upload_queue = xQueueCreate(5, sizeof(upload_queue_item_t));
+    ESP_RETURN_ON_FALSE(ctx->upload_queue, ESP_ERR_NO_MEM, TAG,
+                        "Failed to create upload queue");
+
+    /* Initialize upload task flag */
+    ctx->upload_task_running = true;
+
+    /* Create upload task */
+    BaseType_t ret = xTaskCreate(upload_task, "upload_task", 8192, ctx,
+                                 5, &ctx->upload_task_handle);
+    ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG,
+                        "Failed to create upload task");
+
     return ESP_OK;
 }
 
 /* =========================================================================
- * Flush one CMAF segment and upload it
+ * Asynchronous upload task
+ * ========================================================================= */
+
+static void upload_task(void *arg)
+{
+    push_av_ctx_t *ctx = (push_av_ctx_t *)arg;
+    upload_queue_item_t item;
+    TickType_t timeout = pdMS_TO_TICKS(1000); /* 1 second timeout */
+
+    ESP_LOGI(TAG, "Upload task started");
+
+    while (ctx->upload_task_running) {
+        /* Wait for a segment to upload */
+        if (xQueueReceive(ctx->upload_queue, &item, timeout) == pdTRUE) {
+            /* Upload the segment */
+            esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
+            if (err == ESP_OK) {
+                ctx->total_segments++;
+                ESP_LOGD(TAG, "Uploaded segment #%"PRIu16" (%zu B)", item.seg_num, item.size);
+            } else {
+                ESP_LOGW(TAG, "Upload segment #%"PRIu16" failed: %s", item.seg_num, esp_err_to_name(err));
+            }
+
+            /* Free the segment data (we took ownership when enqueuing) */
+            free(item.data);
+        }
+        /* If timeout, check if we should continue (allows graceful shutdown) */
+    }
+
+    /* Drain any remaining items in the queue before exiting */
+    while (xQueueReceive(ctx->upload_queue, &item, 0) == pdTRUE) {
+        ESP_LOGI(TAG, "Draining queued segment #%"PRIu16" on shutdown", item.seg_num);
+        esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
+        if (err == ESP_OK) {
+            ctx->total_segments++;
+        }
+        free(item.data);
+    }
+
+    ESP_LOGI(TAG, "Upload task exiting");
+    vTaskDelete(NULL);
+}
+
+/* =========================================================================
+ * Flush one CMAF segment and enqueue it for asynchronous upload
  * ========================================================================= */
 
 static esp_err_t flush_and_upload_segment(push_av_ctx_t *ctx)
@@ -508,17 +585,25 @@ static esp_err_t flush_and_upload_segment(push_av_ctx_t *ctx)
         return err;
     }
 
-    err = cmaf_push_upload_media_segment(ctx->push, seg, size);
-    free(seg);
+    /* Enqueue the segment for asynchronous upload */
+    upload_queue_item_t item = {
+        .data = seg,      /* Transfer ownership to upload task */
+        .size = size,
+        .seg_num = seg_num,
+    };
 
-    if (err == ESP_OK) {
-        ctx->total_segments++;
-        /* Update base decode time for the next segment */
-        ctx->segment_base_decode_time = ctx->total_decode_time;
-    } else {
-        ESP_LOGW(TAG, "upload segment #%"PRIu16" failed", seg_num);
+    if (xQueueSend(ctx->upload_queue, &item, pdMS_TO_TICKS(100)) != pdTRUE) {
+        /* Queue full - this should be rare, but log it */
+        ESP_LOGW(TAG, "Upload queue full, dropping segment #%"PRIu16, seg_num);
+        free(seg);  /* Free if we can't enqueue */
+        return ESP_ERR_NO_MEM;
     }
-    return err;
+
+    /* Update base decode time for the next segment (do this immediately) */
+    ctx->segment_base_decode_time = ctx->total_decode_time;
+
+    ESP_LOGD(TAG, "Enqueued segment #%"PRIu16" (%zu B) for upload", seg_num, size);
+    return ESP_OK;
 }
 
 /* =========================================================================
@@ -726,6 +811,24 @@ static void push_av_stream_task(void *arg)
 
     ESP_LOGI(TAG, "Stream ended: %" PRIu32 " segments in %" PRIu32 " s",
              ctx->total_segments, total_sec);
+
+    /* ------------------------------------------------------------------ */
+    /* 11. Cleanup: stop upload task and wait for queued uploads to finish */
+    /* ------------------------------------------------------------------ */
+    if (ctx->upload_task_handle) {
+        ESP_LOGI(TAG, "Stopping upload task and waiting for queued uploads...");
+        ctx->upload_task_running = false;
+
+        /* Wait for upload task to drain the queue and exit (max 10 seconds) */
+        /* The task will delete itself after draining */
+        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        /* Delete the queue (task should have exited by now) */
+        if (ctx->upload_queue) {
+            vQueueDelete(ctx->upload_queue);
+            ctx->upload_queue = NULL;
+        }
+    }
 
     vTaskDelete(NULL);
 }
