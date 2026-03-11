@@ -34,7 +34,7 @@ extern "C" {
 #define CMAF_MUX_MAX_FRAMES_PER_SEGMENT  128
 
 /** Internal AVCC data buffer size (bytes, allocated from PSRAM). */
-#define CMAF_MUX_SEG_BUF_SIZE  (1024 * 1024)
+#define CMAF_MUX_SEG_BUF_SIZE  (2 * 1024 * 1024)
 
 typedef struct cmaf_mux_ctx *cmaf_mux_handle_t;
 

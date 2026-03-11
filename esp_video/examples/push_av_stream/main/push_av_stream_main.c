@@ -850,8 +850,10 @@ static void push_av_stream_task(void *arg)
     /* ------------------------------------------------------------------ */
     /* 10. Upload static MPD → close session                               */
     /* ------------------------------------------------------------------ */
-    int64_t total_us = esp_timer_get_time() - ctx->stream_start_us;
-    uint32_t total_sec = (uint32_t)(total_us / 1000000ULL);
+    /* Calculate duration from actual segments uploaded, not wall-clock time.
+     * Each segment is SEGMENT_DURATION_TICKS / VIDEO_TIMESCALE seconds.
+     * For 30 fps and 30 frames/segment: 90000 ticks / 90000 Hz = 1 second/segment */
+    uint32_t total_sec = ctx->total_segments * (SEGMENT_DURATION_TICKS / VIDEO_TIMESCALE);
     if (total_sec == 0) total_sec = 1;
 
     ret = mpd_gen_static(mpd_buf, sizeof(mpd_buf), &mpd_p, total_sec, &mpd_len);
@@ -865,8 +867,10 @@ static void push_av_stream_task(void *arg)
         }
     }
 
-    ESP_LOGI(TAG, "Stream ended: %" PRIu32 " segments in %" PRIu32 " s",
-             ctx->total_segments, total_sec);
+    int64_t total_us = esp_timer_get_time() - ctx->stream_start_us;
+    uint32_t wall_clock_sec = (uint32_t)(total_us / 1000000ULL);
+    ESP_LOGI(TAG, "Stream ended: %" PRIu32 " segments (%" PRIu32 " s content, %" PRIu32 " s wall-clock)",
+             ctx->total_segments, total_sec, wall_clock_sec);
 
     /* ------------------------------------------------------------------ */
     /* 11. Cleanup: stop upload task and wait for queued uploads to finish */
