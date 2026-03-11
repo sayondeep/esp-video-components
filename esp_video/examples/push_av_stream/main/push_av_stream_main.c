@@ -45,6 +45,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -132,6 +133,7 @@ typedef struct {
     /* Asynchronous upload queue */
     QueueHandle_t upload_queue;      /**< FreeRTOS queue for pending segment uploads */
     TaskHandle_t  upload_task_handle; /**< Handle to the upload task */
+    SemaphoreHandle_t http_mutex;    /**< Mutex to protect HTTP client (not thread-safe) */
 
     /* Decode-time tracking */
     uint64_t segment_base_decode_time; /**< decode time of first frame in current seg */
@@ -509,6 +511,11 @@ static esp_err_t setup_cmaf(push_av_ctx_t *ctx,
     ESP_RETURN_ON_FALSE(ctx->upload_queue, ESP_ERR_NO_MEM, TAG,
                         "Failed to create upload queue");
 
+    /* Create mutex to protect HTTP client (not thread-safe) */
+    ctx->http_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(ctx->http_mutex, ESP_ERR_NO_MEM, TAG,
+                        "Failed to create HTTP mutex");
+
     /* Initialize upload task flag */
     ctx->upload_task_running = true;
 
@@ -536,13 +543,18 @@ static void upload_task(void *arg)
     while (ctx->upload_task_running) {
         /* Wait for a segment to upload */
         if (xQueueReceive(ctx->upload_queue, &item, timeout) == pdTRUE) {
-            /* Upload the segment */
-            esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
-            if (err == ESP_OK) {
-                ctx->total_segments++;
-                ESP_LOGD(TAG, "Uploaded segment #%"PRIu16" (%zu B)", item.seg_num, item.size);
-            } else {
-                ESP_LOGW(TAG, "Upload segment #%"PRIu16" failed: %s", item.seg_num, esp_err_to_name(err));
+            /* Take mutex before using HTTP client */
+            if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
+                /* Upload the segment */
+                esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
+                xSemaphoreGive(ctx->http_mutex);
+
+                if (err == ESP_OK) {
+                    ctx->total_segments++;
+                    ESP_LOGD(TAG, "Uploaded segment #%"PRIu16" (%zu B)", item.seg_num, item.size);
+                } else {
+                    ESP_LOGW(TAG, "Upload segment #%"PRIu16" failed: %s", item.seg_num, esp_err_to_name(err));
+                }
             }
 
             /* Free the segment data (we took ownership when enqueuing) */
@@ -554,9 +566,12 @@ static void upload_task(void *arg)
     /* Drain any remaining items in the queue before exiting */
     while (xQueueReceive(ctx->upload_queue, &item, 0) == pdTRUE) {
         ESP_LOGI(TAG, "Draining queued segment #%"PRIu16" on shutdown", item.seg_num);
-        esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
-        if (err == ESP_OK) {
-            ctx->total_segments++;
+        if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
+            esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
+            xSemaphoreGive(ctx->http_mutex);
+            if (err == ESP_OK) {
+                ctx->total_segments++;
+            }
         }
         free(item.data);
     }
@@ -642,7 +657,12 @@ static void push_av_stream_task(void *arg)
     /* ------------------------------------------------------------------ */
     /* 3. Allocate stream on the server                                     */
     /* ------------------------------------------------------------------ */
-    ret = cmaf_push_create_stream(ctx->push);
+    if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
+        ret = cmaf_push_create_stream(ctx->push);
+        xSemaphoreGive(ctx->http_mutex);
+    } else {
+        ret = ESP_FAIL;
+    }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "create_stream failed; aborting");
         vTaskDelete(NULL);
@@ -681,7 +701,12 @@ static void push_av_stream_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    ret = cmaf_push_start_session(ctx->push, mpd_buf, mpd_len);
+    if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
+        ret = cmaf_push_start_session(ctx->push, mpd_buf, mpd_len);
+        xSemaphoreGive(ctx->http_mutex);
+    } else {
+        ret = ESP_FAIL;
+    }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "start_session failed");
         vTaskDelete(NULL);
@@ -700,7 +725,12 @@ static void push_av_stream_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    ret = cmaf_push_upload_init_segment(ctx->push, init_seg, init_size);
+    if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
+        ret = cmaf_push_upload_init_segment(ctx->push, init_seg, init_size);
+        xSemaphoreGive(ctx->http_mutex);
+    } else {
+        ret = ESP_FAIL;
+    }
     free(init_seg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "upload_init_segment failed");
@@ -798,6 +828,26 @@ static void push_av_stream_task(void *arg)
     }
 
     /* ------------------------------------------------------------------ */
+    /* 9.5. Wait for upload queue to drain before uploading static MPD      */
+    /*      (HTTP client is not thread-safe, must wait for upload task)     */
+    /* ------------------------------------------------------------------ */
+    if (ctx->upload_queue) {
+        ESP_LOGI(TAG, "Waiting for queued uploads to complete...");
+        TickType_t wait_start = xTaskGetTickCount();
+        while (uxQueueMessagesWaiting(ctx->upload_queue) > 0 &&
+               (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(30000)) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (uxQueueMessagesWaiting(ctx->upload_queue) > 0) {
+            ESP_LOGW(TAG, "Timeout waiting for upload queue to drain");
+        } else {
+            ESP_LOGI(TAG, "Upload queue drained");
+            /* Small delay to ensure any in-flight HTTP operations complete */
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
     /* 10. Upload static MPD → close session                               */
     /* ------------------------------------------------------------------ */
     int64_t total_us = esp_timer_get_time() - ctx->stream_start_us;
@@ -805,8 +855,14 @@ static void push_av_stream_task(void *arg)
     if (total_sec == 0) total_sec = 1;
 
     ret = mpd_gen_static(mpd_buf, sizeof(mpd_buf), &mpd_p, total_sec, &mpd_len);
-    if (ret == ESP_OK) {
-        cmaf_push_end_session(ctx->push, mpd_buf, mpd_len);
+    if (ret == ESP_OK && ctx->http_mutex) {
+        /* Take mutex before using HTTP client for static MPD upload */
+        if (xSemaphoreTake(ctx->http_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
+            cmaf_push_end_session(ctx->push, mpd_buf, mpd_len);
+            xSemaphoreGive(ctx->http_mutex);
+        } else {
+            ESP_LOGW(TAG, "Timeout waiting for HTTP mutex to upload static MPD");
+        }
     }
 
     ESP_LOGI(TAG, "Stream ended: %" PRIu32 " segments in %" PRIu32 " s",
@@ -827,6 +883,12 @@ static void push_av_stream_task(void *arg)
         if (ctx->upload_queue) {
             vQueueDelete(ctx->upload_queue);
             ctx->upload_queue = NULL;
+        }
+
+        /* Delete the mutex */
+        if (ctx->http_mutex) {
+            vSemaphoreDelete(ctx->http_mutex);
+            ctx->http_mutex = NULL;
         }
     }
 
