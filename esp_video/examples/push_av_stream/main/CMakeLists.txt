@@ -1,8 +1,11 @@
 set(srcs
     "push_av_stream_main.c"
     "cmaf_mux.c"
-    "cmaf_push.c"
     "mpd_gen.c"
+    "ingest_transport.c"
+    "ingest_adapters/matter_adapter.c"
+    "ingest_adapters/mistserver_adapter.c"
+    "ingest_adapters/srs_adapter.c"
 )
 
 # server_root_ca.pem is ALWAYS embedded for TLS server certificate verification.

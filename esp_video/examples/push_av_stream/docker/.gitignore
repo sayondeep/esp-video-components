@@ -1,0 +1,13 @@
+# Docker volumes and data
+srs/objs/
+nginx-rtmp/hls/
+cmaf-server/data/
+cmaf-server/certs/
+
+# Logs
+*.log
+
+# Certificates (if generated)
+*.pem
+*.key
+*.crt

@@ -25,6 +25,39 @@ also presents a client certificate (mutual TLS).
 
 ## Quick start
 
+### Option 1: Docker Media Servers (Recommended for Testing)
+
+For quick local testing, you can use Docker-based media servers. See [`docker/README.md`](docker/README.md) for details.
+
+**Quick start with SRS (Simple Realtime Server):**
+
+```bash
+cd docker
+docker-compose up -d srs
+
+# Find your host IP
+hostname -I | awk '{print $1}'  # Linux
+# or
+ipconfig getifaddr en0          # macOS
+
+# Test upload (optional)
+./test_upload.sh <YOUR_HOST_IP> 8080 video1
+```
+
+Then configure ESP32 with:
+- `SERVER_HOST`: Your Docker host IP
+- `SERVER_PORT`: `8080`
+- `USE_MTLS`: `n` (disabled for SRS)
+
+**Other Docker options:**
+- MediaMTX: `docker-compose up -d mediamtx`
+- Nginx-RTMP: `docker-compose up -d nginx-rtmp`
+- Python CMAF Server: `docker-compose up -d cmaf-server`
+
+See [`docker/QUICK_START.md`](docker/QUICK_START.md) for detailed instructions.
+
+### Option 2: Matter push_av_server (Original)
+
 ### 1. Start push_av_server on your PC
 
 ```bash

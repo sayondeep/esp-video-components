@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # Option 1: SRS (Simple Realtime Server) - Recommended for CMAF/DASH
+  srs:
+    image: ossrs/srs:5
+    container_name: srs-cmaf
+    ports:
+      - "1935:1935"   # RTMP
+      - "8080:8080"   # HTTP API
+      - "1985:1985"   # HTTP API (alternative)
+      - "8000:8000"   # HTTP streaming
+      - "8443:8443"   # HTTPS streaming
+    volumes:
+      - ./srs/conf:/usr/local/srs/conf
+      - ./srs/objs:/usr/local/srs/objs
+    command: ["./objs/srs", "-c", "conf/docker.conf"]
+    networks:
+      - media-network
+    restart: unless-stopped
+
+  # Option 2: MediaMTX (formerly rtsp-simple-server) - Lightweight
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx-cmaf
+    ports:
+      - "8554:8554"   # RTSP
+      - "1935:1935"   # RTMP
+      - "8888:8888"   # HTTP API
+      - "8889:8889"   # HTTP-FLV
+      - "8180:8180"   # WebRTC
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+    command: ["mediamtx", "/mediamtx.yml"]
+    networks:
+      - media-network
+    restart: unless-stopped
+
+  # Option 3: Nginx with RTMP module - For HTTP PUT ingest
+  nginx-rtmp:
+    build:
+      context: ./nginx-rtmp
+      dockerfile: Dockerfile
+    container_name: nginx-rtmp-cmaf
+    ports:
+      - "1935:1935"   # RTMP
+      - "8080:8080"   # HTTP/HLS
+      - "8443:8443"   # HTTPS
+    volumes:
+      - ./nginx-rtmp/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx-rtmp/html:/usr/share/nginx/html
+      - ./nginx-rtmp/hls:/var/www/hls
+    networks:
+      - media-network
+    restart: unless-stopped
+
+  # Option 4: Simple Python CMAF server (like push_av_server but containerized)
+  cmaf-server:
+    build:
+      context: ./cmaf-server
+      dockerfile: Dockerfile
+    container_name: cmaf-server
+    ports:
+      - "1234:1234"   # HTTPS ingest
+      - "8080:8080"   # HTTP (optional)
+    volumes:
+      - ./cmaf-server/data:/app/data
+      - ./cmaf-server/certs:/app/certs
+    environment:
+      - SERVER_IP=0.0.0.0
+      - SERVER_PORT=1234
+      - WORKING_DIR=/app/data
+    networks:
+      - media-network
+    restart: unless-stopped
+
+networks:
+  media-network:
+    driver: bridge

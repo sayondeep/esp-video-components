@@ -56,7 +56,7 @@
 #include "example_video_common.h"
 
 #include "cmaf_mux.h"
-#include "cmaf_push.h"
+#include "ingest_transport.h"
 #include "mpd_gen.h"
 
 /* =========================================================================
@@ -128,7 +128,7 @@ typedef struct {
 
     /* CMAF modules */
     cmaf_mux_handle_t  mux;
-    cmaf_push_handle_t push;
+    ingest_transport_handle_t transport;
 
     /* Asynchronous upload queue */
     QueueHandle_t upload_queue;      /**< FreeRTOS queue for pending segment uploads */
@@ -487,24 +487,30 @@ static esp_err_t setup_cmaf(push_av_ctx_t *ctx,
     ESP_RETURN_ON_ERROR(cmaf_mux_init(&mux_params, &ctx->mux),
                         TAG, "cmaf_mux_init");
 
-    /* Initialise HTTPS push client */
-    cmaf_push_config_t push_cfg = {
-        .server_host     = CONFIG_EXAMPLE_SERVER_HOST,
-        .server_port     = CONFIG_EXAMPLE_SERVER_PORT,
-        .track_name      = CONFIG_EXAMPLE_TRACK_NAME,
-        /* Always provide server CA for TLS server certificate verification */
-        .server_ca_pem   = server_root_ca_pem_start,
+    /* Initialise ingest transport */
+    ingest_transport_config_t transport_cfg = {
+        .server_type = INGEST_SERVER_MATTER,
+        .server_host = CONFIG_EXAMPLE_SERVER_HOST,
+        .server_port = CONFIG_EXAMPLE_SERVER_PORT,
+        .track_name  = CONFIG_EXAMPLE_TRACK_NAME,
+        .auth = {
 #if CONFIG_EXAMPLE_USE_MTLS
-        /* Client cert/key only needed for mTLS (client authentication) */
-        .client_cert_pem = client_cert_pem_start,
-        .client_key_pem  = client_key_pem_start,
+            .method = INGEST_AUTH_MTLS,
+            .credentials = {
+                .mtls = {
+                    .server_ca_pem   = server_root_ca_pem_start,
+                    .client_cert_pem = client_cert_pem_start,
+                    .client_key_pem  = client_key_pem_start,
+                }
+            }
 #else
-        .client_cert_pem = NULL,
-        .client_key_pem  = NULL,
+            .method = INGEST_AUTH_NONE,
+            .credentials = {0}
 #endif
+        }
     };
-    ESP_RETURN_ON_ERROR(cmaf_push_init(&push_cfg, &ctx->push),
-                        TAG, "cmaf_push_init");
+    ESP_RETURN_ON_ERROR(ingest_transport_init(&transport_cfg, &ctx->transport),
+                        TAG, "ingest_transport_init");
 
     /* Create upload queue (hold up to 5 segments to buffer network delays) */
     ctx->upload_queue = xQueueCreate(5, sizeof(upload_queue_item_t));
@@ -546,7 +552,7 @@ static void upload_task(void *arg)
             /* Take mutex before using HTTP client */
             if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
                 /* Upload the segment */
-                esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
+                esp_err_t err = ingest_transport_upload_media_segment(ctx->transport, item.data, item.size);
                 xSemaphoreGive(ctx->http_mutex);
 
                 if (err == ESP_OK) {
@@ -567,7 +573,7 @@ static void upload_task(void *arg)
     while (xQueueReceive(ctx->upload_queue, &item, 0) == pdTRUE) {
         ESP_LOGI(TAG, "Draining queued segment #%"PRIu16" on shutdown", item.seg_num);
         if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
-            esp_err_t err = cmaf_push_upload_media_segment(ctx->push, item.data, item.size);
+            esp_err_t err = ingest_transport_upload_media_segment(ctx->transport, item.data, item.size);
             xSemaphoreGive(ctx->http_mutex);
             if (err == ESP_OK) {
                 ctx->total_segments++;
@@ -589,7 +595,7 @@ static esp_err_t flush_and_upload_segment(push_av_ctx_t *ctx)
     uint8_t *seg  = NULL;
     size_t   size = 0;
 
-    uint16_t seg_num = cmaf_push_get_segment_number(ctx->push);
+    uint16_t seg_num = ingest_transport_get_segment_number(ctx->transport);
 
     esp_err_t err = cmaf_mux_flush_segment(ctx->mux,
                                             seg_num,
@@ -658,7 +664,8 @@ static void push_av_stream_task(void *arg)
     /* 3. Allocate stream on the server                                     */
     /* ------------------------------------------------------------------ */
     if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
-        ret = cmaf_push_create_stream(ctx->push);
+        ingest_stream_info_t stream_info;
+        ret = ingest_transport_create_stream(ctx->transport, &stream_info);
         xSemaphoreGive(ctx->http_mutex);
     } else {
         ret = ESP_FAIL;
@@ -683,7 +690,7 @@ static void push_av_stream_task(void *arg)
         .framerate    = VIDEO_FRAMERATE,
         .timescale    = VIDEO_TIMESCALE,
         .seg_duration = SEGMENT_DURATION_TICKS,
-        .start_number = CMAF_PUSH_FIRST_SEGMENT_NUMBER,
+        .start_number = 1001,  /* Matter/CMAF spec requires segment numbers start at 1001 */
         .track_name   = CONFIG_EXAMPLE_TRACK_NAME,
         .codecs       = codecs_str,
         .bandwidth    = (uint32_t)CONFIG_EXAMPLE_H264_BITRATE,
@@ -702,7 +709,7 @@ static void push_av_stream_task(void *arg)
         return;
     }
     if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
-        ret = cmaf_push_start_session(ctx->push, mpd_buf, mpd_len);
+        ret = ingest_transport_start_session(ctx->transport, mpd_buf, mpd_len);
         xSemaphoreGive(ctx->http_mutex);
     } else {
         ret = ESP_FAIL;
@@ -726,7 +733,7 @@ static void push_av_stream_task(void *arg)
         return;
     }
     if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
-        ret = cmaf_push_upload_init_segment(ctx->push, init_seg, init_size);
+        ret = ingest_transport_upload_init_segment(ctx->transport, init_seg, init_size);
         xSemaphoreGive(ctx->http_mutex);
     } else {
         ret = ESP_FAIL;
@@ -860,7 +867,7 @@ static void push_av_stream_task(void *arg)
     if (ret == ESP_OK && ctx->http_mutex) {
         /* Take mutex before using HTTP client for static MPD upload */
         if (xSemaphoreTake(ctx->http_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
-            cmaf_push_end_session(ctx->push, mpd_buf, mpd_len);
+            ingest_transport_end_session(ctx->transport, mpd_buf, mpd_len);
             xSemaphoreGive(ctx->http_mutex);
         } else {
             ESP_LOGW(TAG, "Timeout waiting for HTTP mutex to upload static MPD");
