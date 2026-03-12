@@ -36,6 +36,11 @@ from zeroconf import ServiceInfo, Zeroconf
 
 log = logging.getLogger(__name__)
 
+# Register XML namespaces so that serialized MPD XML preserves the correct
+# namespace prefixes instead of using auto-generated "ns0:" etc.
+xml.etree.ElementTree.register_namespace('', 'urn:mpeg:dash:schema:mpd:2011')
+xml.etree.ElementTree.register_namespace('xsi', 'http://www.w3.org/2001/XMLSchema-instance')
+
 module_dir_path = os.path.dirname(os.path.realpath(__file__))
 templates_path = os.path.join(module_dir_path, "templates")
 static_path = os.path.join(module_dir_path, "static")
@@ -520,6 +525,12 @@ class PushAvServer:
         self.strict_mode = strict_mode
         self.router = APIRouter()
 
+        # Per-stream tracking of segment uploads for dynamic AST adjustment.
+        # The firmware may produce content slower than real-time, so we track
+        # how much content is actually available and adjust availabilityStartTime
+        # dynamically when serving the MPD to players.
+        self.stream_segment_info = {}  # stream_id_str -> {...}
+
         # In-memory map to track camera streams
         self.streams = self._list_streams()
 
@@ -545,6 +556,10 @@ class PushAvServer:
         self.router.add_api_route("/certs/{hierarchy}/{name}", self.certificate_details, methods=["GET"], status_code=200)
         self.router.add_api_route("/certs/{name}/keypair", self.create_client_keypair, methods=["POST"])
         self.router.add_api_route("/certs/{name}/sign", self.sign_client_certificate, methods=["POST"])
+
+        # UTCTiming endpoint: DASH players use this to synchronise their clock
+        # with the server, preventing segment-request drift on live streams.
+        self.router.add_api_route("/time", self.utc_time, methods=["GET", "HEAD"])
 
     # Utilities
 
@@ -690,9 +705,54 @@ class PushAvServer:
                 # time (no SNTP on local networks), but the server always does.
                 # This ensures DASH players compute correct segment numbers/times.
                 if mpd_type == "dynamic":
+                    # Extract SegmentTemplate parameters for dynamic AST tracking
+                    ns_map = {'dash': 'urn:mpeg:dash:schema:mpd:2011'}
+                    ns_uri = 'urn:mpeg:dash:schema:mpd:2011'
+                    seg_tmpl = root.find('.//dash:SegmentTemplate', ns_map)
+                    if seg_tmpl is not None:
+                        timescale = int(seg_tmpl.get('timescale', '90000'))
+                        seg_dur = int(seg_tmpl.get('duration', '90000'))
+                        start_num = int(seg_tmpl.get('startNumber', '1'))
+                        media_pat = seg_tmpl.get('media', '')
+                        self.stream_segment_info[str(stream_id)] = {
+                            'timescale': timescale,
+                            'seg_duration': seg_dur,
+                            'start_number': start_num,
+                            'uses_time': '$Time$' in media_pat,
+                            'latest_content_sec': 0.0,
+                            'mpd_xml_tree': root,   # Cache parsed tree for fast GET serving
+                            'first_segment_wall_time': None,
+                            'last_segment_wall_time': None,
+                        }
+                        log.info(f"Stream {stream_id}: tracking segments "
+                                 f"(timescale={timescale}, seg_duration={seg_dur}, "
+                                 f"startNumber={start_num}, time_based={'$Time$' in media_pat})")
+
+                    # Set initial AST to current wall-clock time
                     now_utc = datetime.datetime.now(datetime.timezone.utc)
                     ast_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
                     root.set('availabilityStartTime', ast_str)
+
+                    # Build the server's /time URL for HTTP-based UTCTiming.
+                    # Prefer the Host header; fall back to request URL.
+                    host_header = req.headers.get('host', '')
+                    if host_header:
+                        time_url = f"https://{host_header}/time"
+                    else:
+                        time_url = str(req.url).rsplit('/', 1)[0] + "/time"
+
+                    # Replace or insert UTCTiming element.
+                    # The firmware may already include a "direct" UTCTiming; we
+                    # upgrade it to http-iso so the player actively fetches the
+                    # server's clock on every MPD refresh.
+                    existing_utc = root.find(f'{{{ns_uri}}}UTCTiming')
+                    if existing_utc is not None:
+                        root.remove(existing_utc)
+                    utc_timing = xml.etree.ElementTree.Element(f'{{{ns_uri}}}UTCTiming')
+                    utc_timing.set('schemeIdUri', 'urn:mpeg:dash:utc:http-iso:2012')
+                    utc_timing.set('value', time_url)
+                    root.insert(0, utc_timing)
+
                     # Re-serialize the corrected MPD
                     body = xml.etree.ElementTree.tostring(root, encoding='unicode', xml_declaration=True).encode('utf-8')
                     log.info(f"Fixed availabilityStartTime to {ast_str} in dynamic MPD")
@@ -729,6 +789,31 @@ class PushAvServer:
                     session.uploaded_segments.append((file_path_with_ext, file_path_with_ext + ".crt"))
                 else:
                     errors.append("No active session when uploading " + file_path_with_ext + ", segment uploaded before mpd")
+
+                # Track latest segment presentation time for dynamic AST calculation.
+                # This allows the server to adjust availabilityStartTime in the MPD
+                # so that DASH players request segments that actually exist.
+                if ext == "m4s":
+                    sid = str(stream_id)
+                    info = self.stream_segment_info.get(sid)
+                    if info:
+                        now_wall = datetime.datetime.now(datetime.timezone.utc)
+                        if info.get('first_segment_wall_time') is None:
+                            info['first_segment_wall_time'] = now_wall
+                        info['last_segment_wall_time'] = now_wall
+
+                        seg_match = re.search(r'segment_(\d+)$', file_path)
+                        if seg_match:
+                            seg_id = int(seg_match.group(1))
+                            if info['uses_time']:
+                                # $Time$ naming: seg_id is the presentation time in timescale units
+                                content_sec = (seg_id + info['seg_duration']) / info['timescale']
+                            else:
+                                # $Number$ naming: seg_id is the segment number
+                                content_sec = (seg_id - info['start_number'] + 1) * info['seg_duration'] / info['timescale']
+                            if content_sec > info['latest_content_sec']:
+                                info['latest_content_sec'] = content_sec
+                                log.debug(f"Stream {stream_id}: content available up to {content_sec:.1f}s")
 
                 # The Track's init segment is uploaded as `session_name/track_name/track_name.init`.
                 # Note that the extension is not part of the `file_path` variable.
@@ -849,16 +934,78 @@ class PushAvServer:
     async def segment_download(self, stream_id: int, file_path: str):
         """
         Handle segment download requests.
-        Segment naming is determined by firmware configuration:
-          - Number-based (Recording): segment_1001.m4s, segment_1002.m4s, ...
-          - Timestamp-based (LiveStream): segment_<presentation_time>.m4s
+
+        For dynamic (live) MPDs the server dynamically adjusts
+        ``availabilityStartTime`` (AST) on every GET so the DASH player's
+        perceived "live edge" matches the content that has actually been
+        uploaded by the firmware.
+
+        Because the ESP32 produces content *slower* than real-time
+        (encoding + TLS upload of a 1 s segment takes ~1.2 – 1.4 s),
+        a safety margin is subtracted from the advertised content duration.
+        This prevents the player from consuming its buffer faster than
+        the firmware can replenish it, which would otherwise cause periodic
+        stalls every ~30 seconds.
+
+        Formula:
+            effective = latest_content_sec - margin
+            AST      = now_utc - timedelta(seconds=effective)
+            → player sees live edge ≈ effective seconds of content
+
+        The UTCTiming element is also refreshed to the current server UTC
+        so the player can compensate for any local-clock drift.
         """
         file_path_obj = self.wd.path("streams", str(stream_id), file_path)
 
-        if file_path_obj.exists():
-            return FileResponse(file_path_obj)
+        if not file_path_obj.exists():
+            raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
 
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+        # ── Dynamic MPD: serve from cached XML tree with adjusted AST ──
+        if file_path.endswith('.mpd'):
+            info = self.stream_segment_info.get(str(stream_id))
+            if info and info.get('mpd_xml_tree') is not None and info['latest_content_sec'] > 0:
+                root = info['mpd_xml_tree']
+                if root.attrib.get('type') == 'dynamic':
+                    try:
+                        now_utc = datetime.datetime.now(datetime.timezone.utc)
+                        content = info['latest_content_sec']
+
+                        # Safety margin: ramps from 0 → 2 s as content grows.
+                        # Prevents the player running ahead of the firmware's
+                        # slower-than-realtime content production rate.
+                        margin = min(2.0, max(0.0, content - 3.0))
+                        effective = max(0.0, content - margin)
+
+                        ast = now_utc - datetime.timedelta(seconds=effective)
+                        ast_str = ast.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        root.set('availabilityStartTime', ast_str)
+
+                        # UTCTiming value is a URL (/time endpoint) and does not
+                        # need refreshing — the player fetches it on demand.
+
+                        modified_mpd = xml.etree.ElementTree.tostring(
+                            root, encoding='unicode', xml_declaration=True)
+
+                        log.debug(f"Serving dynamic MPD: AST={ast_str} "
+                                  f"(content={content:.1f}s, margin={margin:.1f}s)")
+
+                        return Response(
+                            content=modified_mpd,
+                            media_type="application/dash+xml",
+                            headers={
+                                "Cache-Control": "no-cache, no-store, must-revalidate",
+                            })
+                    except Exception as e:
+                        log.warning(f"Failed to adjust MPD AST dynamically: {e}")
+
+        # ── Segments & init files: immutable once written ──
+        if file_path.endswith('.m4s') or file_path.endswith('.init'):
+            return FileResponse(
+                file_path_obj,
+                media_type="video/mp4",
+                headers={"Cache-Control": "public, max-age=3600, immutable"})
+
+        return FileResponse(file_path_obj)
 
     def list_certs(self):
         server = [f.name for f in pathlib.Path(self.wd.path("certs", "server")).iterdir()]
@@ -919,6 +1066,21 @@ class PushAvServer:
         (key, cert, created) = self.device_hierarchy.gen_cert(name, req.csr, override)
 
         return {"key": key, "cert": cert, "created": created}
+
+    def utc_time(self):
+        """Return current UTC time as ISO 8601 string.
+
+        Used by DASH players via ``<UTCTiming schemeIdUri=
+        "urn:mpeg:dash:utc:http-iso:2012">`` to synchronise their
+        internal clock with the server, avoiding segment-request drift.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return Response(
+            content=now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+            })
 
 
 class PushAvContext:
