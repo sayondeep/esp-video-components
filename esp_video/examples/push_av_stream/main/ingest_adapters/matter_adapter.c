@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_http_client.h"
+#include "sdkconfig.h"
 #include "ingest_transport.h"
 
 static const char *TAG = "matter_adapter";
@@ -91,6 +92,12 @@ static void drain_response(esp_http_client_handle_t http)
 /**
  * PUT or POST a data buffer to the given URL.
  *
+ * The connection is kept alive between requests — esp_http_client_close()
+ * is NOT called on success.  This avoids a full TLS re-handshake per
+ * segment upload (~200-800 ms on ESP32).  esp_http_client_open() will
+ * transparently reuse the existing TCP+TLS session when talking to the
+ * same host:port, which is always the case for our segment uploads.
+ *
  * @param http         HTTP client handle (URL already set by caller).
  * @param method       HTTP_METHOD_PUT or HTTP_METHOD_POST.
  * @param url          Full URL for this request.
@@ -125,6 +132,8 @@ static esp_err_t do_request(esp_http_client_handle_t http,
     err = esp_http_client_open(http, (int)data_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "open failed (%s): %s", url, esp_err_to_name(err));
+        /* Connection may be broken; close so the next open reconnects. */
+        esp_http_client_close(http);
         return err;
     }
 
@@ -140,25 +149,27 @@ static esp_err_t do_request(esp_http_client_handle_t http,
     int content_length = esp_http_client_fetch_headers(http);
     int status = esp_http_client_get_status_code(http);
 
-    /* Read response body */
+    /* Fully drain response body so the connection can be reused.
+     * We read into resp_buf first (if requested), then drain the rest. */
     if (resp_buf && resp_buf_sz > 0 && content_length != 0) {
         int rd = esp_http_client_read(http, resp_buf, (int)(resp_buf_sz - 1));
         if (rd >= 0) {
             resp_buf[rd] = '\0';
             if (resp_len) *resp_len = (size_t)rd;
         }
-    } else {
-        drain_response(http);
     }
+    /* Always drain any remaining bytes (covers partial reads & chunked TE) */
+    drain_response(http);
 
-    esp_http_client_close(http);
+    /* Do NOT call esp_http_client_close() here — keep the TCP+TLS session
+     * alive.  The next esp_http_client_open() reuses it automatically. */
 
     if (status < 200 || status >= 300) {
         ESP_LOGW(TAG, "HTTP %d for %s", status, url);
         return ESP_FAIL;
     }
 
-    (void)content_length; /* suppress unused warning when resp_buf is NULL */
+    (void)content_length;
     return ESP_OK;
 }
 
@@ -234,9 +245,22 @@ static esp_err_t matter_upload_init_segment_impl(struct matter_ctx *ctx,
 }
 
 static esp_err_t matter_upload_media_segment_impl(struct matter_ctx *ctx,
-                                                   const uint8_t *data, size_t size)
+                                                   const uint8_t *data, size_t size,
+                                                   uint32_t presentation_time)
 {
     char url[URL_BUF_LEN];
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    /* Use presentation_time (timestamp) for filename - better for live streams */
+    snprintf(url, sizeof(url),
+             "https://%s:%d/streams/%d/session_%"PRIu32"/%s/segment_%"PRIu32".m4s",
+             ctx->server_host, ctx->server_port,
+             ctx->stream_id, ctx->session_number,
+             ctx->track_name, presentation_time);
+
+    ESP_LOGI(TAG, "PUT seg #%"PRIu16" (time=%"PRIu32", %zu B) → %s",
+             ctx->segment_number, presentation_time, size, url);
+#else
+    /* Use segment_number for filename - Matter spec compliant for recordings */
     snprintf(url, sizeof(url),
              "https://%s:%d/streams/%d/session_%"PRIu32"/%s/segment_%"PRIu16".m4s",
              ctx->server_host, ctx->server_port,
@@ -245,6 +269,8 @@ static esp_err_t matter_upload_media_segment_impl(struct matter_ctx *ctx,
 
     ESP_LOGI(TAG, "PUT seg #%"PRIu16" (%zu B) → %s",
              ctx->segment_number, size, url);
+    (void)presentation_time; /* Not used in number-based mode */
+#endif
 
     esp_err_t err = do_request(ctx->http, HTTP_METHOD_PUT, url,
                                 data, size, "video/iso.segment",
@@ -290,7 +316,7 @@ static esp_err_t matter_adapter_start_session(ingest_transport_handle_t h,
 static esp_err_t matter_adapter_upload_init_segment(ingest_transport_handle_t h,
                                                       const uint8_t *data, size_t size);
 static esp_err_t matter_adapter_upload_media_segment(ingest_transport_handle_t h,
-                                                       const uint8_t *data, size_t size);
+                                                       const uint8_t *data, size_t size, uint32_t presentation_time);
 static esp_err_t matter_adapter_end_session(ingest_transport_handle_t h,
                                              const char *mpd_xml, size_t mpd_len);
 static uint16_t matter_adapter_get_segment_number(ingest_transport_handle_t h);
@@ -364,8 +390,8 @@ static esp_err_t matter_adapter_init(ingest_transport_handle_t h,
         .skip_cert_common_name_check = false,
         .keep_alive_enable = true,
         .timeout_ms      = 10000,
-        .buffer_size     = 4096,
-        .buffer_size_tx  = 4096,
+        .buffer_size     = 8192,
+        .buffer_size_tx  = 16384,  /* Larger TX buffer → fewer TCP writes per ~600 KB segment */
     };
 
     matter_ctx->http = esp_http_client_init(&http_cfg);
@@ -445,7 +471,8 @@ static esp_err_t matter_adapter_upload_init_segment(ingest_transport_handle_t h,
 }
 
 static esp_err_t matter_adapter_upload_media_segment(ingest_transport_handle_t h,
-                                                       const uint8_t *data, size_t size)
+                                                       const uint8_t *data, size_t size,
+                                                       uint32_t presentation_time)
 {
     ESP_RETURN_ON_FALSE(h && data && size, ESP_ERR_INVALID_ARG, TAG, "NULL arg");
 
@@ -456,7 +483,7 @@ static esp_err_t matter_adapter_upload_media_segment(ingest_transport_handle_t h
     struct matter_ctx *ctx = adapter_ctx->matter_ctx;
     ESP_RETURN_ON_FALSE(ctx->session_number > 0, ESP_ERR_INVALID_STATE, TAG,
                         "call start_session first");
-    return matter_upload_media_segment_impl(ctx, data, size);
+    return matter_upload_media_segment_impl(ctx, data, size, presentation_time);
 }
 
 static esp_err_t matter_adapter_end_session(ingest_transport_handle_t h,

@@ -41,6 +41,7 @@
 #include <sys/errno.h>
 #include <sys/stat.h>
 #include <inttypes.h>
+#include <time.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -50,6 +51,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_sntp.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "protocol_examples_common.h"
@@ -111,6 +113,7 @@ typedef struct {
     uint8_t  *data;      /**< Segment data (allocated, caller transfers ownership) */
     size_t    size;      /**< Segment size in bytes */
     uint16_t  seg_num;   /**< Segment number for logging */
+    uint32_t  presentation_time; /**< Presentation time in timescale units (for timestamp-based naming) */
 } upload_queue_item_t;
 
 typedef struct {
@@ -525,9 +528,13 @@ static esp_err_t setup_cmaf(push_av_ctx_t *ctx,
     /* Initialize upload task flag */
     ctx->upload_task_running = true;
 
-    /* Create upload task */
-    BaseType_t ret = xTaskCreate(upload_task, "upload_task", 8192, ctx,
-                                 5, &ctx->upload_task_handle);
+    /* Create upload task.
+     * Priority 6 (one above the streaming task at 5) so that a queued
+     * segment upload preempts frame encoding.  This keeps the upload
+     * pipeline moving and prevents segment backlog.
+     * Stack 16384: TLS encrypt/write of ~600 KB segments needs headroom. */
+    BaseType_t ret = xTaskCreate(upload_task, "upload_task", 16384, ctx,
+                                 6, &ctx->upload_task_handle);
     ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG,
                         "Failed to create upload task");
 
@@ -552,7 +559,7 @@ static void upload_task(void *arg)
             /* Take mutex before using HTTP client */
             if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
                 /* Upload the segment */
-                esp_err_t err = ingest_transport_upload_media_segment(ctx->transport, item.data, item.size);
+                esp_err_t err = ingest_transport_upload_media_segment(ctx->transport, item.data, item.size, item.presentation_time);
                 xSemaphoreGive(ctx->http_mutex);
 
                 if (err == ESP_OK) {
@@ -573,7 +580,7 @@ static void upload_task(void *arg)
     while (xQueueReceive(ctx->upload_queue, &item, 0) == pdTRUE) {
         ESP_LOGI(TAG, "Draining queued segment #%"PRIu16" on shutdown", item.seg_num);
         if (xSemaphoreTake(ctx->http_mutex, portMAX_DELAY) == pdTRUE) {
-            esp_err_t err = ingest_transport_upload_media_segment(ctx->transport, item.data, item.size);
+            esp_err_t err = ingest_transport_upload_media_segment(ctx->transport, item.data, item.size, item.presentation_time);
             xSemaphoreGive(ctx->http_mutex);
             if (err == ESP_OK) {
                 ctx->total_segments++;
@@ -611,6 +618,7 @@ static esp_err_t flush_and_upload_segment(push_av_ctx_t *ctx)
         .data = seg,      /* Transfer ownership to upload task */
         .size = size,
         .seg_num = seg_num,
+        .presentation_time = ctx->segment_base_decode_time, /* Use presentation time for timestamp-based naming */
     };
 
     if (xQueueSend(ctx->upload_queue, &item, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -694,6 +702,7 @@ static void push_av_stream_task(void *arg)
         .track_name   = CONFIG_EXAMPLE_TRACK_NAME,
         .codecs       = codecs_str,
         .bandwidth    = (uint32_t)CONFIG_EXAMPLE_H264_BITRATE,
+        .availability_start_time = time(NULL),  /* SNTP-synced wall-clock time (server may refine on upload) */
     };
 
     /* ------------------------------------------------------------------ */
@@ -907,6 +916,42 @@ static void push_av_stream_task(void *arg)
 }
 
 /* =========================================================================
+ * SNTP time synchronisation
+ *
+ * Provides wall-clock time for the MPD's availabilityStartTime and
+ * UTCTiming elements.  Without this the ESP32 epoch is 1970-01-01
+ * which makes DASH live timing meaningless.
+ * ========================================================================= */
+
+static void init_sntp_time_sync(void)
+{
+    ESP_LOGI(TAG, "Initialising SNTP for wall-clock time…");
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_init();
+
+    const int max_retries = 15;
+    for (int i = 0; i < max_retries; i++) {
+        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            time_t now = time(NULL);
+            struct tm tm_buf;
+            gmtime_r(&now, &tm_buf);
+            char ts[32];
+            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+            ESP_LOGI(TAG, "SNTP synced: %s", ts);
+            return;
+        }
+        ESP_LOGI(TAG, "Waiting for SNTP sync… (%d/%d)", i + 1, max_retries);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    ESP_LOGW(TAG, "SNTP sync failed after %d retries; MPD timing may be incorrect",
+             max_retries);
+}
+
+/* =========================================================================
  * Application entry point
  * ========================================================================= */
 
@@ -929,6 +974,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(example_connect());
+
+    /* Synchronise wall-clock via SNTP (needed for MPD availabilityStartTime) */
+    init_sntp_time_sync();
 
     /* Allocate context */
     push_av_ctx_t *ctx = calloc(1, sizeof(*ctx));

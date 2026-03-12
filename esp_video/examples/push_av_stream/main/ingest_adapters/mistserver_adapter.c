@@ -213,8 +213,9 @@ static esp_err_t mistserver_upload_init_segment(ingest_transport_handle_t h,
 }
 
 static esp_err_t mistserver_upload_media_segment(ingest_transport_handle_t h,
-                                                   const uint8_t *data, size_t size)
+                                                   const uint8_t *data, size_t size, uint32_t presentation_time)
 {
+    (void)presentation_time; /* Not used for MistServer - uses sequential numbering */
     ESP_RETURN_ON_FALSE(h && data && size, ESP_ERR_INVALID_ARG, TAG, "NULL arg");
 
     struct ingest_transport_ctx *transport_ctx = (struct ingest_transport_ctx *)h;

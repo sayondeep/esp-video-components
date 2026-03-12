@@ -161,8 +161,9 @@ typedef struct {
 
     /**
      * @brief Upload media segment
+     * @param presentation_time Presentation time in timescale units (for timestamp-based naming)
      */
-    esp_err_t (*upload_media_segment)(ingest_transport_handle_t h, const uint8_t *data, size_t size);
+    esp_err_t (*upload_media_segment)(ingest_transport_handle_t h, const uint8_t *data, size_t size, uint32_t presentation_time);
 
     /**
      * @brief End session (upload static MPD if required)
@@ -200,7 +201,7 @@ esp_err_t ingest_transport_start_session(ingest_transport_handle_t h,
 esp_err_t ingest_transport_upload_init_segment(ingest_transport_handle_t h,
                                                  const uint8_t *data, size_t size);
 esp_err_t ingest_transport_upload_media_segment(ingest_transport_handle_t h,
-                                                  const uint8_t *data, size_t size);
+                                                  const uint8_t *data, size_t size, uint32_t presentation_time);
 esp_err_t ingest_transport_end_session(ingest_transport_handle_t h,
                                        const char *mpd_xml, size_t mpd_len);
 uint16_t ingest_transport_get_segment_number(ingest_transport_handle_t h);

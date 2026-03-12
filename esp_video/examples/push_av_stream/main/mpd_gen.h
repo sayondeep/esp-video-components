@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -39,6 +40,7 @@ typedef struct {
     const char *track_name;     /**< Track / Representation id, e.g. "video1" */
     const char *codecs;         /**< DASH codecs string, e.g. "avc1.4D001F" */
     uint32_t    bandwidth;      /**< Approximate bitrate in bps */
+    time_t      availability_start_time; /**< UTC epoch when stream starts (for availabilityStartTime) */
 } mpd_params_t;
 
 /**

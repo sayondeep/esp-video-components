@@ -74,6 +74,30 @@ menu "Example Configuration"
                 Stop streaming after this many seconds.
                 Set to 0 for continuous operation until reset.
 
+        choice EXAMPLE_SEGMENT_NAMING
+            prompt "Segment naming mode"
+            default EXAMPLE_SEGMENT_NAMING_NUMBER
+            help
+                Choose how segment filenames are generated:
+                - Number-based: Uses segment_<number>.m4s (Matter spec compliant for recordings)
+                - Timestamp-based: Uses segment_<timestamp>.m4s (better for live streams)
+
+            config EXAMPLE_SEGMENT_NAMING_NUMBER
+                bool "Number-based (Recording/Static)"
+                help
+                    Use sequential segment numbers (segment_1001.m4s, segment_1002.m4s, ...)
+                    Compliant with Matter PushAV spec for recordings/static streams.
+                    MPD uses $Number$ template.
+
+            config EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+                bool "Timestamp-based (Live/Dynamic)"
+                help
+                    Use presentation timestamps (segment_<timestamp>.m4s)
+                    Better for live/dynamic streams as it matches player requests.
+                    MPD uses $Time$ template.
+
+        endchoice
+
     endmenu
 
     menu "H.264 Encoder"

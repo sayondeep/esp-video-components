@@ -63,7 +63,7 @@ static esp_err_t srs_adapter_start_session(ingest_transport_handle_t h,
 static esp_err_t srs_adapter_upload_init_segment(ingest_transport_handle_t h,
                                                   const uint8_t *data, size_t size);
 static esp_err_t srs_adapter_upload_media_segment(ingest_transport_handle_t h,
-                                                   const uint8_t *data, size_t size);
+                                                   const uint8_t *data, size_t size, uint32_t presentation_time);
 static esp_err_t srs_adapter_end_session(ingest_transport_handle_t h,
                                           const char *mpd_xml, size_t mpd_len);
 static uint16_t srs_adapter_get_segment_number(ingest_transport_handle_t h);
@@ -225,8 +225,9 @@ static esp_err_t srs_adapter_upload_init_segment(ingest_transport_handle_t h,
 }
 
 static esp_err_t srs_adapter_upload_media_segment(ingest_transport_handle_t h,
-                                                   const uint8_t *data, size_t size)
+                                                   const uint8_t *data, size_t size, uint32_t presentation_time)
 {
+    (void)presentation_time; /* Not used for SRS - uses sequential numbering */
     struct ingest_transport_ctx *transport_ctx = (struct ingest_transport_ctx *)h;
     struct srs_adapter_ctx *ctx = (struct srs_adapter_ctx *)transport_ctx->adapter_ctx;
     ESP_RETURN_ON_FALSE(ctx, ESP_ERR_INVALID_STATE, TAG, "not initialized");

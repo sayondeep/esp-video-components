@@ -131,14 +131,14 @@ esp_err_t ingest_transport_upload_init_segment(ingest_transport_handle_t h,
 }
 
 esp_err_t ingest_transport_upload_media_segment(ingest_transport_handle_t h,
-                                                  const uint8_t *data, size_t size)
+                                                  const uint8_t *data, size_t size, uint32_t presentation_time)
 {
     ESP_RETURN_ON_FALSE(h && data && size, ESP_ERR_INVALID_ARG, TAG, "NULL arg");
 
     struct ingest_transport_ctx *ctx = (struct ingest_transport_ctx *)h;
     ESP_RETURN_ON_FALSE(ctx->ops, ESP_ERR_INVALID_STATE, TAG, "not initialized");
 
-    return ctx->ops->upload_media_segment(h, data, size);
+    return ctx->ops->upload_media_segment(h, data, size, presentation_time);
 }
 
 esp_err_t ingest_transport_end_session(ingest_transport_handle_t h,

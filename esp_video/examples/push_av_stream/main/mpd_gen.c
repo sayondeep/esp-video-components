@@ -20,13 +20,17 @@
  *
  * SegmentTemplate paths are relative to the MPD location (session_X/):
  *   initialization: "<track_name>/<track_name>.init"
- *   media:          "<track_name>/segment_$Number$.m4s"
+ *   media:          "<track_name>/segment_$Number$.m4s" (for recordings)
+ *                   or "<track_name>/segment_$Time$.m4s" (for live streams)
+ *                   (selected via CONFIG_EXAMPLE_SEGMENT_NAMING)
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
 #include "esp_err.h"
+#include "sdkconfig.h"
 #include "mpd_gen.h"
 
 /* =========================================================================
@@ -43,6 +47,24 @@ esp_err_t mpd_gen_dynamic(char *buf, size_t buf_size,
     /* Duration of one segment as an ISO 8601 duration string (PT<N>S) */
     float seg_sec = (float)p->seg_duration / (float)p->timescale;
 
+    /* MPD update period: 2× segment duration reduces polling overhead
+     * while keeping the player reasonably up-to-date. */
+    float min_update_sec = 2.0f * seg_sec;
+
+    /* Format availabilityStartTime as ISO 8601 UTC string */
+    char ast_str[32];
+    struct tm tm_buf;
+    gmtime_r(&p->availability_start_time, &tm_buf);
+    strftime(ast_str, sizeof(ast_str), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+
+    /* Build the media attribute with track name and segment naming scheme */
+    char media_attr[128];
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    snprintf(media_attr, sizeof(media_attr), "%s/segment_$Time$.m4s", p->track_name);
+#else
+    snprintf(media_attr, sizeof(media_attr), "%s/segment_$Number$.m4s", p->track_name);
+#endif
+
     int n = snprintf(buf, buf_size,
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"\n"
@@ -53,11 +75,13 @@ esp_err_t mpd_gen_dynamic(char *buf, size_t buf_size,
         "     type=\"dynamic\"\n"
         "     profiles=\"urn:mpeg:dash:profile:isoff-live:2011,"
               "urn:mpeg:cmaf:2019\"\n"
-        "     minBufferTime=\"PT2S\"\n"
-        "     suggestedPresentationDelay=\"PT4S\"\n"
-        "     timeShiftBufferDepth=\"PT60S\"\n"
-        "     availabilityStartTime=\"1970-01-01T00:00:00Z\"\n"
+        "     minBufferTime=\"PT1S\"\n"
+        "     suggestedPresentationDelay=\"PT3S\"\n"
+        "     timeShiftBufferDepth=\"PT30S\"\n"
+        "     availabilityStartTime=\"%s\"\n"
         "     minimumUpdatePeriod=\"PT%.1fS\">\n"
+        "  <UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:direct:2014\"\n"
+        "             value=\"%s\"/>\n"
         "  <Period id=\"1\" start=\"PT0S\">\n"
         "    <AdaptationSet id=\"1\"\n"
         "                   mimeType=\"video/mp4\"\n"
@@ -70,19 +94,21 @@ esp_err_t mpd_gen_dynamic(char *buf, size_t buf_size,
         "                       duration=\"%"PRIu32"\"\n"
         "                       startNumber=\"%"PRIu32"\"\n"
         "                       initialization=\"%s/%s.init\"\n"
-        "                       media=\"%s/segment_$Number$.m4s\"/>\n"
+        "                       media=\"%s\"/>\n"
         "      <Representation id=\"%s\" bandwidth=\"%"PRIu32"\"/>\n"
         "    </AdaptationSet>\n"
         "  </Period>\n"
         "</MPD>\n",
-        seg_sec,
+        ast_str,
+        min_update_sec,
+        ast_str,  /* UTCTiming value = same wall-clock time as AST */
         p->codecs,
         p->width, p->height, p->framerate,
         p->timescale,
         p->seg_duration,
         p->start_number,
         p->track_name, p->track_name,
-        p->track_name,
+        media_attr,
         p->track_name, p->bandwidth);
 
     if (n < 0 || (size_t)n >= buf_size) {
@@ -104,6 +130,14 @@ esp_err_t mpd_gen_static(char *buf, size_t buf_size,
     if (!buf || !p || !out_len || buf_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    /* Build the media attribute with track name and segment naming scheme */
+    char media_attr[128];
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    snprintf(media_attr, sizeof(media_attr), "%s/segment_$Time$.m4s", p->track_name);
+#else
+    snprintf(media_attr, sizeof(media_attr), "%s/segment_$Number$.m4s", p->track_name);
+#endif
 
     int n = snprintf(buf, buf_size,
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -129,7 +163,7 @@ esp_err_t mpd_gen_static(char *buf, size_t buf_size,
         "                       duration=\"%"PRIu32"\"\n"
         "                       startNumber=\"%"PRIu32"\"\n"
         "                       initialization=\"%s/%s.init\"\n"
-        "                       media=\"%s/segment_$Number$.m4s\"/>\n"
+        "                       media=\"%s\"/>\n"
         "      <Representation id=\"%s\" bandwidth=\"%"PRIu32"\"/>\n"
         "    </AdaptationSet>\n"
         "  </Period>\n"
@@ -141,7 +175,7 @@ esp_err_t mpd_gen_static(char *buf, size_t buf_size,
         p->seg_duration,
         p->start_number,
         p->track_name, p->track_name,
-        p->track_name,
+        media_attr,
         p->track_name, p->bandwidth);
 
     if (n < 0 || (size_t)n >= buf_size) {

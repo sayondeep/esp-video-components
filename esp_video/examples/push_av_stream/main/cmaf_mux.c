@@ -605,7 +605,13 @@ esp_err_t cmaf_mux_flush_segment(cmaf_mux_handle_t h,
 
     /* Output buffer: styp(24) + moof(moof_size) + mdat(8 + seg_buf_pos) */
     size_t total_cap = 24 + moof_size + 8 + h->seg_buf_pos + 32 /* padding */;
-    uint8_t *buf = malloc(total_cap);
+    /* Prefer PSRAM for the ~600 KB segment output — keeps internal SRAM free
+     * for stack/heap and avoids fragmentation from repeated large allocs. */
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(total_cap,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = (uint8_t *)malloc(total_cap); /* fall back to internal RAM */
+    }
     ESP_RETURN_ON_FALSE(buf, ESP_ERR_NO_MEM, TAG, "malloc media segment");
 
     bw_t w;
