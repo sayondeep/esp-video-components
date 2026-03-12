@@ -47,9 +47,9 @@ esp_err_t mpd_gen_dynamic(char *buf, size_t buf_size,
     /* Duration of one segment as an ISO 8601 duration string (PT<N>S) */
     float seg_sec = (float)p->seg_duration / (float)p->timescale;
 
-    /* MPD update period: 2× segment duration reduces polling overhead
-     * while keeping the player reasonably up-to-date. */
-    float min_update_sec = 2.0f * seg_sec;
+    /* MPD update period: 1× segment duration gives the player a fresh
+     * AST every segment, keeping the live-edge tight. */
+    float min_update_sec = seg_sec;
 
     /* Format availabilityStartTime as ISO 8601 UTC string */
     char ast_str[32];
@@ -76,7 +76,7 @@ esp_err_t mpd_gen_dynamic(char *buf, size_t buf_size,
         "     profiles=\"urn:mpeg:dash:profile:isoff-live:2011,"
               "urn:mpeg:cmaf:2019\"\n"
         "     minBufferTime=\"PT1S\"\n"
-        "     suggestedPresentationDelay=\"PT3S\"\n"
+        "     suggestedPresentationDelay=\"PT2S\"\n"
         "     timeShiftBufferDepth=\"PT30S\"\n"
         "     availabilityStartTime=\"%s\"\n"
         "     minimumUpdatePeriod=\"PT%.1fS\">\n"

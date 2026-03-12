@@ -970,10 +970,10 @@ class PushAvServer:
                         now_utc = datetime.datetime.now(datetime.timezone.utc)
                         content = info['latest_content_sec']
 
-                        # Safety margin: ramps from 0 → 2 s as content grows.
-                        # Prevents the player running ahead of the firmware's
-                        # slower-than-realtime content production rate.
-                        margin = min(2.0, max(0.0, content - 3.0))
+                        # Safety margin: ramps from 0 → 1 s as content grows.
+                        # Small buffer so the player doesn't outrun the
+                        # firmware when it occasionally dips below real-time.
+                        margin = min(1.0, max(0.0, content - 2.0))
                         effective = max(0.0, content - margin)
 
                         ast = now_utc - datetime.timedelta(seconds=effective)
