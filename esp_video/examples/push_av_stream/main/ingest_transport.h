@@ -29,12 +29,14 @@ typedef struct ingest_transport_ctx *ingest_transport_handle_t;
  * @brief Server type identifier
  */
 typedef enum {
-    INGEST_SERVER_MATTER,      /**< Matter push_av_server (DASH Interface-2) */
-    INGEST_SERVER_MISTSERVER,  /**< MistServer (CMAF push) */
-    INGEST_SERVER_AWS,         /**< AWS Elemental MediaLive */
-    INGEST_SERVER_AZURE,       /**< Azure Media Services */
-    INGEST_SERVER_WOWZA,       /**< Wowza Streaming Engine */
-    INGEST_SERVER_GENERIC,     /**< Generic DASH-IF compliant server */
+    /** Matter push_av_server — DASH-IF Interface-2 over HTTPS (mTLS optional).
+     *  Run: python push_av_server/server.py --working-directory ~/.pavstest */
+    INGEST_SERVER_MATTER,
+
+    /** nagare-media/ingest — DASH-IF Interface-2 over plain HTTP.
+     *  https://github.com/nagare-media/ingest
+     *  Run: docker compose up nagare  (from the docker/ directory) */
+    INGEST_SERVER_NAGARE,
 } ingest_server_type_t;
 
 /**

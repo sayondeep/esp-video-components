@@ -1,0 +1,56 @@
+apiVersion: ingest.nagare.media/v1alpha1
+kind: Config
+
+servers:
+  - name: default
+    address: :8080
+    http: {}
+    apps:
+
+      # ---------------------------------------------------------------
+      # Serve DASH/HLS output — handles GET requests at /streams
+      # ---------------------------------------------------------------
+      - name: streams_serve
+        http:
+          host: "**"
+          path: /streams
+          cors:
+            allowOrigins: "*"
+            allowMethods: GET,HEAD,OPTIONS
+            allowHeaders: "*"
+            maxAge: 86400
+        genericServe:
+          appRef:
+            name: streams_ingest
+          volumeRefs:
+            - name: storage
+
+      # ---------------------------------------------------------------
+      # DASH-IF Interface-2 ingest — handles POST/PUT at /streams
+      #
+      # ESP32 sends:
+      #   POST /streams?interface=dash              → get stream ID
+      #   PUT  /streams/{id}/session_1/index.mpd    → dynamic MPD
+      #   PUT  /streams/{id}/session_1/{track}/{track}.init
+      #   PUT  /streams/{id}/session_1/{track}/segment_NNNN.m4s
+      #   PUT  /streams/{id}/session_1/index.mpd    → static MPD (close)
+      #
+      # Play back with dash.js:
+      #   http://<HOST>:8080/streams/{id}/session_1/index.mpd
+      # ---------------------------------------------------------------
+      - name: streams_ingest
+        http:
+          host: "**"
+          path: /streams
+        dashAndHlsIngest:
+          volumeRef:
+            name: storage
+
+volumes:
+  # In-memory storage — segments are lost on container restart.
+  # To persist across restarts, switch to:
+  #   fs:
+  #     path: /data
+  # and add a volume mount in docker-compose.yml.
+  - name: storage
+    mem: {}

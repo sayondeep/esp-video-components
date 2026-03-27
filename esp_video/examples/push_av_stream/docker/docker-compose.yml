@@ -1,75 +1,31 @@
-version: '3.8'
-
 services:
-  # Option 1: SRS (Simple Realtime Server) - Recommended for CMAF/DASH
-  srs:
-    image: ossrs/srs:5
-    container_name: srs-cmaf
-    ports:
-      - "1935:1935"   # RTMP
-      - "8080:8080"   # HTTP API
-      - "1985:1985"   # HTTP API (alternative)
-      - "8000:8000"   # HTTP streaming
-      - "8443:8443"   # HTTPS streaming
-    volumes:
-      - ./srs/conf:/usr/local/srs/conf
-      - ./srs/objs:/usr/local/srs/objs
-    command: ["./objs/srs", "-c", "conf/docker.conf"]
-    networks:
-      - media-network
-    restart: unless-stopped
 
-  # Option 2: MediaMTX (formerly rtsp-simple-server) - Lightweight
-  mediamtx:
-    image: bluenviron/mediamtx:latest
-    container_name: mediamtx-cmaf
+  # -----------------------------------------------------------------------
+  # nagare-media/ingest — DASH-IF Interface-2 ingest server (plain HTTP)
+  #
+  # Usage:
+  #   docker compose up nagare
+  #
+  # Configure the ESP32 firmware (idf.py menuconfig):
+  #   Example Configuration → Ingest Server
+  #     Server type : nagare-media/ingest (plain HTTP)
+  #     Host        : <this machine's LAN IP>
+  #     Port        : 8080
+  #     Track name  : video1  (or whatever you set)
+  #
+  # Playback URL (substitute track name for {track}):
+  #   http://<HOST>:8080/dash/{track}.str/manifest.mpd
+  # -----------------------------------------------------------------------
+  nagare:
+    image: ghcr.io/nagare-media/ingest:dev
+    container_name: nagare-ingest
     ports:
-      - "8554:8554"   # RTSP
-      - "1935:1935"   # RTMP
-      - "8888:8888"   # HTTP API
-      - "8889:8889"   # HTTP-FLV
-      - "8180:8180"   # WebRTC
+      - "8080:8080"
     volumes:
-      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
-    command: ["mediamtx", "/mediamtx.yml"]
-    networks:
-      - media-network
-    restart: unless-stopped
-
-  # Option 3: Nginx with RTMP module - For HTTP PUT ingest
-  nginx-rtmp:
-    build:
-      context: ./nginx-rtmp
-      dockerfile: Dockerfile
-    container_name: nginx-rtmp-cmaf
-    ports:
-      - "1935:1935"   # RTMP
-      - "8080:8080"   # HTTP/HLS
-      - "8443:8443"   # HTTPS
-    volumes:
-      - ./nginx-rtmp/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx-rtmp/html:/usr/share/nginx/html
-      - ./nginx-rtmp/hls:/var/www/hls
-    networks:
-      - media-network
-    restart: unless-stopped
-
-  # Option 4: Simple Python CMAF server (like push_av_server but containerized)
-  cmaf-server:
-    build:
-      context: ./cmaf-server
-      dockerfile: Dockerfile
-    container_name: cmaf-server
-    ports:
-      - "1234:1234"   # HTTPS ingest
-      - "8080:8080"   # HTTP (optional)
-    volumes:
-      - ./cmaf-server/data:/app/data
-      - ./cmaf-server/certs:/app/certs
-    environment:
-      - SERVER_IP=0.0.0.0
-      - SERVER_PORT=1234
-      - WORKING_DIR=/app/data
+      - ./recordings:/recordings
+    configs:
+      - source: nagare_config
+        target: /etc/nagare-media/ingest/config.yaml
     networks:
       - media-network
     restart: unless-stopped
@@ -77,3 +33,43 @@ services:
 networks:
   media-network:
     driver: bridge
+
+# Inline config — no separate file needed, works from any directory.
+configs:
+  nagare_config:
+    content: |
+      apiVersion: ingest.nagare.media/v1alpha1
+      kind: Config
+
+      servers:
+        - name: default
+          address: :8080
+          http: {}
+          apps:
+            - name: dash_serve
+              http:
+                host: "**"
+                path: /dash
+                cors:
+                  allowOrigins: "*"
+                  allowMethods: GET,HEAD,OPTIONS
+                  allowHeaders: "*"
+                  maxAge: 86400
+              genericServe:
+                appRef:
+                  name: dash_ingest
+                volumeRefs:
+                  - name: storage
+
+            - name: dash_ingest
+              http:
+                host: "**"
+                path: /dash
+              dashAndHlsIngest:
+                volumeRef:
+                  name: storage
+
+      volumes:
+        - name: storage
+          fs:
+            path: /recordings

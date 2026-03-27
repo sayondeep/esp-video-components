@@ -20,8 +20,7 @@
 
 /* Include adapter headers */
 #include "ingest_adapters/matter_adapter.h"
-#include "ingest_adapters/mistserver_adapter.h"
-#include "ingest_adapters/srs_adapter.h"
+#include "ingest_adapters/nagare_adapter.h"
 
 static const char *TAG = "ingest_transport";
 
@@ -52,28 +51,9 @@ esp_err_t ingest_transport_init(const ingest_transport_config_t *config,
         case INGEST_SERVER_MATTER:
             ops = matter_adapter_get_ops();
             break;
-        case INGEST_SERVER_MISTSERVER:
-            ops = mistserver_adapter_get_ops();
+        case INGEST_SERVER_NAGARE:
+            ops = nagare_adapter_get_ops();
             break;
-        case INGEST_SERVER_WOWZA:
-            /* SRS adapter - reuse Wowza type for SRS */
-            ops = srs_adapter_get_ops();
-            break;
-        case INGEST_SERVER_AWS:
-            /* TODO: Implement AWS adapter */
-            ESP_LOGE(TAG, "AWS adapter not yet implemented");
-            free(ctx);
-            return ESP_ERR_NOT_SUPPORTED;
-        case INGEST_SERVER_AZURE:
-            /* TODO: Implement Azure adapter */
-            ESP_LOGE(TAG, "Azure adapter not yet implemented");
-            free(ctx);
-            return ESP_ERR_NOT_SUPPORTED;
-        case INGEST_SERVER_GENERIC:
-            /* TODO: Implement generic adapter */
-            ESP_LOGE(TAG, "Generic adapter not yet implemented");
-            free(ctx);
-            return ESP_ERR_NOT_SUPPORTED;
         default:
             ESP_LOGE(TAG, "Unknown server type: %d", config->server_type);
             free(ctx);

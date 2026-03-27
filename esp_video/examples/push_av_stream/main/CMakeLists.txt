@@ -4,22 +4,25 @@ set(srcs
     "mpd_gen.c"
     "ingest_transport.c"
     "ingest_adapters/matter_adapter.c"
-    "ingest_adapters/mistserver_adapter.c"
-    "ingest_adapters/srs_adapter.c"
+    "ingest_adapters/nagare_adapter.c"
 )
 
-# server_root_ca.pem is ALWAYS embedded for TLS server certificate verification.
-# client_cert.pem / client_key.pem are only needed when mTLS is enabled.
-if(CONFIG_EXAMPLE_USE_MTLS)
-    set(embed_files
-        "certs/server_root_ca.pem"
-        "certs/client_cert.pem"
-        "certs/client_key.pem"
-    )
+# TLS cert files are only needed for the Matter backend (HTTPS).
+# nagare-media/ingest uses plain HTTP — no certs required.
+if(CONFIG_EXAMPLE_SERVER_TYPE_MATTER)
+    if(CONFIG_EXAMPLE_USE_MTLS)
+        set(embed_files
+            "certs/server_root_ca.pem"
+            "certs/client_cert.pem"
+            "certs/client_key.pem"
+        )
+    else()
+        set(embed_files
+            "certs/server_root_ca.pem"
+        )
+    endif()
 else()
-    set(embed_files
-        "certs/server_root_ca.pem"
-    )
+    set(embed_files "")
 endif()
 
 idf_component_register(

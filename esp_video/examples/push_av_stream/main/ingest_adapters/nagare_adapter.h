@@ -5,8 +5,10 @@
  */
 
 /**
- * @file antmedia_adapter.h
- * @brief Ant Media Server CMAF/DASH ingest adapter
+ * @file nagare_adapter.h
+ * @brief nagare-media/ingest adapter (DASH-IF Interface-2 over plain HTTP)
+ *
+ * https://github.com/nagare-media/ingest
  */
 
 #pragma once
@@ -17,11 +19,7 @@
 extern "C" {
 #endif
 
-/**
- * @brief Get Ant Media Server adapter operations
- * @return Pointer to operations structure
- */
-const ingest_transport_ops_t *antmedia_adapter_get_ops(void);
+const ingest_transport_ops_t *nagare_adapter_get_ops(void);
 
 #ifdef __cplusplus
 }

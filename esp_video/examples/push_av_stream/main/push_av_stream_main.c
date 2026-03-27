@@ -94,7 +94,8 @@ static const char *TAG = "push_av";
  * Embedded TLS certificates (placed in main/certs/ by the user)
  * ========================================================================= */
 
-/* server_root_ca_pem is always embedded for TLS server certificate verification */
+/* TLS certs are only embedded when using the Matter backend */
+#if CONFIG_EXAMPLE_SERVER_TYPE_MATTER
 extern const char server_root_ca_pem_start[]
     asm("_binary_server_root_ca_pem_start");
 #if CONFIG_EXAMPLE_USE_MTLS
@@ -102,7 +103,8 @@ extern const char client_cert_pem_start[]
     asm("_binary_client_cert_pem_start");
 extern const char client_key_pem_start[]
     asm("_binary_client_key_pem_start");
-#endif
+#endif /* CONFIG_EXAMPLE_USE_MTLS */
+#endif /* CONFIG_EXAMPLE_SERVER_TYPE_MATTER */
 
 /* =========================================================================
  * Context
@@ -492,7 +494,11 @@ static esp_err_t setup_cmaf(push_av_ctx_t *ctx,
 
     /* Initialise ingest transport */
     ingest_transport_config_t transport_cfg = {
+#if CONFIG_EXAMPLE_SERVER_TYPE_NAGARE
+        .server_type = INGEST_SERVER_NAGARE,
+#else
         .server_type = INGEST_SERVER_MATTER,
+#endif
         .server_host = CONFIG_EXAMPLE_SERVER_HOST,
         .server_port = CONFIG_EXAMPLE_SERVER_PORT,
         .track_name  = CONFIG_EXAMPLE_TRACK_NAME,
@@ -508,7 +514,6 @@ static esp_err_t setup_cmaf(push_av_ctx_t *ctx,
             }
 #else
             .method = INGEST_AUTH_NONE,
-            .credentials = {0}
 #endif
         }
     };
@@ -763,14 +768,23 @@ static void push_av_stream_task(void *arg)
     ESP_LOGI(TAG, "==============================================");
     ESP_LOGI(TAG, "  CMAF push started!");
     ESP_LOGI(TAG, "  Resolution : %" PRIu32 "x%" PRIu32, ctx->width, ctx->height);
+    ESP_LOGI(TAG, "  Backend    : %s",
+#if CONFIG_EXAMPLE_SERVER_TYPE_NAGARE
+             "nagare-media/ingest (HTTP)"
+#else
+             "Matter push_av_server (HTTPS)"
+#endif
+             );
     ESP_LOGI(TAG, "  Server     : %s:%d",
              CONFIG_EXAMPLE_SERVER_HOST, CONFIG_EXAMPLE_SERVER_PORT);
-    ESP_LOGI(TAG, "  Track      : %s", CONFIG_EXAMPLE_TRACK_NAME);
+    ESP_LOGI(TAG, "  Stream     : %s", CONFIG_EXAMPLE_TRACK_NAME);
     ESP_LOGI(TAG, "  Seg frames : %d  (~%.1f s)",
              CONFIG_EXAMPLE_FRAMES_PER_SEGMENT,
              (float)CONFIG_EXAMPLE_FRAMES_PER_SEGMENT / VIDEO_FRAMERATE);
     ESP_LOGI(TAG, "  mTLS       : %s",
-#if CONFIG_EXAMPLE_USE_MTLS
+#if CONFIG_EXAMPLE_SERVER_TYPE_NAGARE
+             "n/a (plain HTTP)"
+#elif CONFIG_EXAMPLE_USE_MTLS
              "enabled"
 #else
              "disabled"

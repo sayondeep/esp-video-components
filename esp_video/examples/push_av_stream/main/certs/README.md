@@ -1,27 +1,23 @@
-# Certificate Setup
+# Certificate Setup (Matter backend only)
 
-The push_av_server uses a self-signed CA hierarchy. The ESP32 firmware
-**always** needs the server's root CA cert (`server_root_ca.pem`) so that it
-can verify the server's TLS certificate, even when mTLS is disabled.
+Certificates are only needed when using `INGEST_SERVER_MATTER`
+(the Matter push_av_server). The nagare-media/ingest backend uses plain HTTP
+and requires no certificates.
 
-## Quick Setup (no mTLS — default)
+## No-mTLS setup (default for Matter)
 
 ### 1. Start push_av_server
 
 ```bash
 cd connectedhomeip/src/tools/push_av_server
 python3 server.py --working-directory ~/.pavstest \
-                  --server-ip <PC_IP> \
-                  --host 0.0.0.0
+                  --server-ip <PC_IP> --host 0.0.0.0 --no-strict
 ```
 
-This generates the server CA and cert under `~/.pavstest/certs/` on first run.
-
-### 2. Copy the server root CA into the firmware
+### 2. Copy the server root CA
 
 ```bash
-cp ~/.pavstest/certs/server/root.pem \
-   <example>/main/certs/server_root_ca.pem
+cp ~/.pavstest/certs/server/root.pem main/certs/server_root_ca.pem
 ```
 
 ### 3. Build and flash
@@ -32,37 +28,31 @@ idf.py build flash monitor
 
 ---
 
-## Full mTLS Setup (optional)
+## mTLS setup (optional)
 
-Set `CONFIG_EXAMPLE_USE_MTLS=y` in `idf.py menuconfig` and follow the
-additional steps below.
+Enable `CONFIG_EXAMPLE_USE_MTLS` in `idf.py menuconfig`, then:
 
-### 4. Generate a device certificate via the server API
+### 4. Generate a device certificate
 
 ```bash
 curl --cacert ~/.pavstest/certs/server/root.pem \
      -X POST https://<PC_IP>:1234/certs/esp32/keypair | python3 -m json.tool
 ```
 
-Then copy the generated files:
+### 5. Copy the device cert and key
 
 ```bash
 cp ~/.pavstest/certs/device/esp32.pem  main/certs/client_cert.pem
 cp ~/.pavstest/certs/device/esp32.key  main/certs/client_key.pem
 ```
 
-### 5. Build and flash
+### 6. Build and flash
 
 ```bash
-idf.py menuconfig   # enable CONFIG_EXAMPLE_USE_MTLS
 idf.py build flash monitor
 ```
 
 ---
 
-## Notes
-
-- **`server_root_ca.pem`**: Must be updated whenever the push_av_server
-  regenerates its certificate hierarchy (e.g., after deleting `~/.pavstest/`).
-- **`client_cert.pem` / `client_key.pem`**: Only needed with mTLS enabled.
-  Leave as placeholders otherwise.
+**Note:** `server_root_ca.pem` must be refreshed whenever push_av_server
+regenerates its certificate hierarchy (e.g. after deleting `~/.pavstest/`).

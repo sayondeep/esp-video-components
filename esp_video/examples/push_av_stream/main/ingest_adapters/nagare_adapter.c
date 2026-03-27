@@ -1,0 +1,376 @@
+/*
+ * SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: ESPRESSIF MIT
+ */
+
+/**
+ * @file nagare_adapter.c
+ * @brief nagare-media/ingest adapter
+ *
+ * Implements DASH-IF Live Media Ingest Protocol Interface-2 over plain HTTP,
+ * targeting nagare-media/ingest (https://github.com/nagare-media/ingest).
+ *
+ * Configure nagare-media/ingest with a dashAndHlsIngest app mounted at /dash:
+ *
+ *   servers:
+ *     - address: :8080
+ *       apps:
+ *         - name: dash_serve
+ *           http: { path: /dash }
+ *           genericServe:
+ *             appRef: { name: dash }
+ *             volumeRefs: [{ name: mem }]
+ *         - name: dash
+ *           http: { path: /dash }
+ *           dashAndHlsIngest:
+ *             volumeRef: { name: mem }
+ *   volumes:
+ *     - name: mem
+ *       mem: {}
+ *
+ * Ingest URL flow (nagare file-PUT style — no stream creation step):
+ *
+ *   nagare routes ingest via /:name.str/+ so the stream name MUST carry
+ *   a ".str" suffix in the URL.  {stream_name} defaults to the track name.
+ *
+ *   PUT  http://{host}:{port}/dash/{stream_name}.str/manifest.mpd           → dynamic MPD
+ *   PUT  .../dash/{stream_name}.str/{track}/{track}.init                     → init segment
+ *   PUT  .../dash/{stream_name}.str/{track}/segment_NNNN.m4s                → media segments
+ *   PUT  .../dash/{stream_name}.str/manifest.mpd                            → static MPD (close)
+ *
+ * Playback:
+ *   http://{host}:{port}/dash/{stream_name}.str/manifest.mpd
+ */
+
+#include <string.h>
+#include <inttypes.h>
+#include <time.h>
+#include "esp_log.h"
+#include "esp_check.h"
+#include "esp_http_client.h"
+#include "sdkconfig.h"
+#include "ingest_transport.h"
+
+static const char *TAG = "nagare_adapter";
+
+#define URL_BUF_LEN  512
+
+/* Segment numbering: must match start_number in the MPD (1001 per CMAF/Matter spec) */
+#define NAGARE_FIRST_SEGMENT_NUMBER  1001
+
+/* -------------------------------------------------------------------------
+ * Adapter context
+ * ---------------------------------------------------------------------- */
+
+struct nagare_ctx {
+    char     host[128];
+    uint16_t port;
+    char     track_name[64];
+    char     stream_name[80]; /**< "{track_name}_{unix_ts}" — unique per session */
+
+    esp_http_client_handle_t http;
+
+    uint16_t segment_number;
+};
+
+struct ingest_transport_ctx {
+    void *adapter_ctx;
+    const ingest_transport_ops_t *ops;
+};
+
+/* -------------------------------------------------------------------------
+ * HTTP helper
+ * ---------------------------------------------------------------------- */
+
+static void drain_response(esp_http_client_handle_t http)
+{
+    char tmp[64];
+    int  rd;
+    do { rd = esp_http_client_read(http, tmp, sizeof(tmp)); } while (rd > 0);
+}
+
+static esp_err_t do_request(esp_http_client_handle_t http,
+                             esp_http_client_method_t method,
+                             const char *url,
+                             const void *data, size_t data_len,
+                             const char *content_type,
+                             char *resp_buf, size_t resp_buf_sz,
+                             size_t *resp_len)
+{
+    esp_http_client_set_url(http, url);
+    esp_http_client_set_method(http, method);
+
+    if (content_type) {
+        esp_http_client_set_header(http, "Content-Type", content_type);
+    }
+    esp_http_client_set_header(http, "DASH-IF-Ingest", "1.1");
+
+    esp_err_t err = esp_http_client_open(http, (int)data_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "open failed (%s): %s", url, esp_err_to_name(err));
+        esp_http_client_close(http);
+        return err;
+    }
+
+    if (data && data_len > 0) {
+        int written = esp_http_client_write(http, (const char *)data, (int)data_len);
+        if (written < 0) {
+            ESP_LOGE(TAG, "write failed: %s", url);
+            esp_http_client_close(http);
+            return ESP_FAIL;
+        }
+    }
+
+    esp_http_client_fetch_headers(http);
+    int status = esp_http_client_get_status_code(http);
+
+    if (resp_buf && resp_buf_sz > 0) {
+        int rd = esp_http_client_read(http, resp_buf, (int)(resp_buf_sz - 1));
+        if (rd >= 0) {
+            resp_buf[rd] = '\0';
+            if (resp_len) *resp_len = (size_t)rd;
+        }
+    }
+    drain_response(http);
+
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "HTTP %d for %s", status, url);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * Protocol helpers
+ *
+ * Nagare uses a flat file-PUT model: there is no stream-creation handshake.
+ * The client simply PUTs files to /{base_path}/{stream_name}/... and they
+ * are stored and served from the same path.
+ *
+ * URL layout (base_path = /dash, stream_name = track_name):
+ *   PUT /dash/{stream_name}/manifest.mpd          — dynamic MPD (session open)
+ *   PUT /dash/{stream_name}/{track}/{track}.init   — init segment
+ *   PUT /dash/{stream_name}/{track}/segment_N.m4s  — media segments
+ *   PUT /dash/{stream_name}/manifest.mpd           — static MPD (session close)
+ *
+ * These relative paths match the SegmentTemplate in the generated MPD:
+ *   initialization="{track}/{track}.init"
+ *   media="{track}/segment_$Number$.m4s"
+ * ---------------------------------------------------------------------- */
+
+static esp_err_t nagare_start_session_impl(struct nagare_ctx *ctx,
+                                            const char *mpd_xml, size_t mpd_len)
+{
+    ctx->segment_number = NAGARE_FIRST_SEGMENT_NUMBER;
+
+    char url[URL_BUF_LEN];
+    snprintf(url, sizeof(url),
+             "http://%s:%d/dash/%s.str/manifest.mpd",
+             ctx->host, ctx->port, ctx->stream_name);
+
+    ESP_LOGI(TAG, "PUT dynamic MPD → %s", url);
+    return do_request(ctx->http, HTTP_METHOD_PUT, url,
+                      mpd_xml, mpd_len, "application/dash+xml",
+                      NULL, 0, NULL);
+}
+
+static esp_err_t nagare_upload_init_impl(struct nagare_ctx *ctx,
+                                          const uint8_t *data, size_t size)
+{
+    char url[URL_BUF_LEN];
+    snprintf(url, sizeof(url),
+             "http://%s:%d/dash/%s.str/%s/%s.init",
+             ctx->host, ctx->port, ctx->stream_name,
+             ctx->track_name, ctx->track_name);
+
+    ESP_LOGI(TAG, "PUT init (%zu B) → %s", size, url);
+    return do_request(ctx->http, HTTP_METHOD_PUT, url,
+                      data, size, "video/mp4", NULL, 0, NULL);
+}
+
+static esp_err_t nagare_upload_segment_impl(struct nagare_ctx *ctx,
+                                             const uint8_t *data, size_t size,
+                                             uint32_t presentation_time)
+{
+    char url[URL_BUF_LEN];
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    snprintf(url, sizeof(url),
+             "http://%s:%d/dash/%s.str/%s/segment_%"PRIu32".m4s",
+             ctx->host, ctx->port, ctx->stream_name,
+             ctx->track_name, presentation_time);
+#else
+    snprintf(url, sizeof(url),
+             "http://%s:%d/dash/%s.str/%s/segment_%"PRIu16".m4s",
+             ctx->host, ctx->port, ctx->stream_name,
+             ctx->track_name, ctx->segment_number);
+    (void)presentation_time;
+#endif
+
+    esp_err_t err = do_request(ctx->http, HTTP_METHOD_PUT, url,
+                                data, size, "video/iso.segment",
+                                NULL, 0, NULL);
+    if (err == ESP_OK) {
+        ctx->segment_number++;
+    }
+    return err;
+}
+
+static esp_err_t nagare_end_session_impl(struct nagare_ctx *ctx,
+                                          const char *mpd_xml, size_t mpd_len)
+{
+    char url[URL_BUF_LEN];
+    snprintf(url, sizeof(url),
+             "http://%s:%d/dash/%s.str/manifest.mpd",
+             ctx->host, ctx->port, ctx->stream_name);
+
+    ESP_LOGI(TAG, "PUT static MPD → %s", url);
+    return do_request(ctx->http, HTTP_METHOD_PUT, url,
+                      mpd_xml, mpd_len, "application/dash+xml",
+                      NULL, 0, NULL);
+}
+
+/* -------------------------------------------------------------------------
+ * ingest_transport_ops_t implementation
+ * ---------------------------------------------------------------------- */
+
+static esp_err_t nagare_adapter_init(ingest_transport_handle_t h,
+                                      const ingest_transport_config_t *config)
+{
+    ESP_RETURN_ON_FALSE(config && h, ESP_ERR_INVALID_ARG, TAG, "NULL arg");
+    ESP_RETURN_ON_FALSE(config->server_type == INGEST_SERVER_NAGARE,
+                        ESP_ERR_INVALID_ARG, TAG, "not nagare server type");
+
+    struct nagare_ctx *ctx = calloc(1, sizeof(*ctx));
+    ESP_RETURN_ON_FALSE(ctx, ESP_ERR_NO_MEM, TAG, "calloc");
+
+    strncpy(ctx->host, config->server_host, sizeof(ctx->host) - 1);
+    ctx->port = config->server_port;
+    strncpy(ctx->track_name, config->track_name, sizeof(ctx->track_name) - 1);
+    ctx->segment_number = NAGARE_FIRST_SEGMENT_NUMBER;
+
+    /* Append a Unix timestamp so each ESP32 boot writes to a fresh directory.
+     * Falls back to 0 if SNTP has not synced yet (still unique enough to avoid
+     * collisions across reboots once wall-clock time is roughly correct). */
+    snprintf(ctx->stream_name, sizeof(ctx->stream_name),
+             "%s_%"PRIu32, config->track_name, (uint32_t)time(NULL));
+
+    char base_url[URL_BUF_LEN];
+    snprintf(base_url, sizeof(base_url), "http://%s:%d/dash/%s.str",
+             ctx->host, ctx->port, ctx->stream_name);
+
+    esp_http_client_config_t http_cfg = {
+        .url               = base_url,
+        .transport_type    = HTTP_TRANSPORT_OVER_TCP,
+        .keep_alive_enable = true,
+        .timeout_ms        = 10000,
+        .buffer_size       = 8192,
+        .buffer_size_tx    = 16384,
+    };
+
+    ctx->http = esp_http_client_init(&http_cfg);
+    if (!ctx->http) {
+        free(ctx);
+        return ESP_FAIL;
+    }
+
+    struct ingest_transport_ctx *transport_ctx = (struct ingest_transport_ctx *)h;
+    transport_ctx->adapter_ctx = ctx;
+
+    ESP_LOGI(TAG, "nagare adapter initialised: http://%s:%d/dash/%s.str  track=%s",
+             ctx->host, ctx->port, ctx->stream_name, ctx->track_name);
+    return ESP_OK;
+}
+
+static esp_err_t nagare_adapter_create_stream(ingest_transport_handle_t h,
+                                               ingest_stream_info_t *stream_info)
+{
+    struct ingest_transport_ctx *t = (struct ingest_transport_ctx *)h;
+    struct nagare_ctx *ctx = t->adapter_ctx;
+    ESP_RETURN_ON_FALSE(ctx && stream_info, ESP_ERR_INVALID_ARG, TAG, "NULL arg");
+
+    /* Nagare uses a file-PUT model: no HTTP stream-creation handshake needed.
+     * The stream "exists" as soon as the first PUT arrives. */
+    stream_info->stream_id = 1;
+    strncpy(stream_info->stream_key, ctx->stream_name,
+            sizeof(stream_info->stream_key) - 1);
+    snprintf(stream_info->ingest_url, sizeof(stream_info->ingest_url),
+             "http://%s:%d/dash/%s.str", ctx->host, ctx->port, ctx->stream_name);
+
+    ESP_LOGI(TAG, "stream ready  MPD → http://%s:%d/dash/%s.str/manifest.mpd",
+             ctx->host, ctx->port, ctx->stream_name);
+    return ESP_OK;
+}
+
+static esp_err_t nagare_adapter_start_session(ingest_transport_handle_t h,
+                                               const char *mpd_xml, size_t mpd_len)
+{
+    struct ingest_transport_ctx *t = (struct ingest_transport_ctx *)h;
+    struct nagare_ctx *ctx = t->adapter_ctx;
+    ESP_RETURN_ON_FALSE(ctx && mpd_xml && mpd_len, ESP_ERR_INVALID_ARG, TAG, "NULL");
+    return nagare_start_session_impl(ctx, mpd_xml, mpd_len);
+}
+
+static esp_err_t nagare_adapter_upload_init_segment(ingest_transport_handle_t h,
+                                                     const uint8_t *data, size_t size)
+{
+    struct ingest_transport_ctx *t = (struct ingest_transport_ctx *)h;
+    struct nagare_ctx *ctx = t->adapter_ctx;
+    ESP_RETURN_ON_FALSE(ctx && data && size, ESP_ERR_INVALID_ARG, TAG, "NULL");
+    return nagare_upload_init_impl(ctx, data, size);
+}
+
+static esp_err_t nagare_adapter_upload_media_segment(ingest_transport_handle_t h,
+                                                      const uint8_t *data, size_t size,
+                                                      uint32_t presentation_time)
+{
+    struct ingest_transport_ctx *t = (struct ingest_transport_ctx *)h;
+    struct nagare_ctx *ctx = t->adapter_ctx;
+    ESP_RETURN_ON_FALSE(ctx && data && size, ESP_ERR_INVALID_ARG, TAG, "NULL");
+    return nagare_upload_segment_impl(ctx, data, size, presentation_time);
+}
+
+static esp_err_t nagare_adapter_end_session(ingest_transport_handle_t h,
+                                             const char *mpd_xml, size_t mpd_len)
+{
+    struct ingest_transport_ctx *t = (struct ingest_transport_ctx *)h;
+    struct nagare_ctx *ctx = t->adapter_ctx;
+    ESP_RETURN_ON_FALSE(ctx && mpd_xml && mpd_len, ESP_ERR_INVALID_ARG, TAG, "NULL");
+    return nagare_end_session_impl(ctx, mpd_xml, mpd_len);
+}
+
+static uint16_t nagare_adapter_get_segment_number(ingest_transport_handle_t h)
+{
+    struct ingest_transport_ctx *t = (struct ingest_transport_ctx *)h;
+    struct nagare_ctx *ctx = t ? t->adapter_ctx : NULL;
+    return ctx ? ctx->segment_number : 0;
+}
+
+static void nagare_adapter_deinit(ingest_transport_handle_t h)
+{
+    struct ingest_transport_ctx *t = (struct ingest_transport_ctx *)h;
+    if (!t) return;
+    struct nagare_ctx *ctx = t->adapter_ctx;
+    if (!ctx) return;
+    if (ctx->http) {
+        esp_http_client_cleanup(ctx->http);
+    }
+    free(ctx);
+    t->adapter_ctx = NULL;
+}
+
+static const ingest_transport_ops_t nagare_ops = {
+    .init                 = nagare_adapter_init,
+    .create_stream        = nagare_adapter_create_stream,
+    .start_session        = nagare_adapter_start_session,
+    .upload_init_segment  = nagare_adapter_upload_init_segment,
+    .upload_media_segment = nagare_adapter_upload_media_segment,
+    .end_session          = nagare_adapter_end_session,
+    .get_segment_number   = nagare_adapter_get_segment_number,
+    .deinit               = nagare_adapter_deinit,
+};
+
+const ingest_transport_ops_t *nagare_adapter_get_ops(void)
+{
+    return &nagare_ops;
+}
