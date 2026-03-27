@@ -1,26 +1,27 @@
 services:
 
   # -----------------------------------------------------------------------
-  # nagare-media/ingest — DASH-IF Interface-2 ingest server (plain HTTP)
+  # nagare-media/ingest — DASH-IF Interface-2 ingest server
   #
-  # Usage:
+  # Plain HTTP (port 8080):
   #   docker compose up nagare
+  #   menuconfig → Port: 8080  (no TLS)
   #
-  # Configure the ESP32 firmware (idf.py menuconfig):
-  #   Example Configuration → Ingest Server
-  #     Server type : nagare-media/ingest (plain HTTP)
-  #     Host        : <this machine's LAN IP>
-  #     Port        : 8080
-  #     Track name  : video1  (or whatever you set)
+  # HTTPS via nginx TLS proxy (port 8443):
+  #   1. cd certs && ./gen_cert.sh <LAN_IP>  (once)
+  #   2. cp certs/server.crt ../main/certs/nagare_server_ca.pem
+  #   3. docker compose up nagare nagare-tls
+  #   4. menuconfig → EXAMPLE_NAGARE_USE_TLS=y, Port: 8443
   #
-  # Playback URL (substitute track name for {track}):
-  #   http://<HOST>:8080/dash/{track}.str/manifest.mpd
+  # Playback URL:
+  #   http://<HOST>:8080/dash/{track}_{ts}.str/manifest.mpd   (plain)
+  #   https://<HOST>:8443/dash/{track}_{ts}.str/manifest.mpd  (TLS)
   # -----------------------------------------------------------------------
   nagare:
     image: ghcr.io/nagare-media/ingest:dev
     container_name: nagare-ingest
     ports:
-      - "8080:8080"
+      - "8080:8080"       # plain HTTP — keep for development / local playback
     volumes:
       - ./recordings:/recordings
     configs:
@@ -29,6 +30,31 @@ services:
     networks:
       - media-network
     restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # nginx — TLS termination proxy for nagare
+  #
+  # Listens on :8443 (HTTPS), forwards to nagare:8080 (HTTP) on the internal
+  # Docker network.  nagare never sees raw TLS; nginx handles the handshake.
+  #
+  # Requires ./certs/server.crt and ./certs/server.key to exist.
+  # Generate them with:  cd certs && ./gen_cert.sh <LAN_IP>
+  # -----------------------------------------------------------------------
+  nagare-tls:
+    image: nginx:alpine
+    container_name: nagare-nginx
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./nginx:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - nagare
+    networks:
+      - media-network
+    restart: unless-stopped
+    profiles:
+      - tls    # only started with: docker compose --profile tls up
 
 networks:
   media-network:

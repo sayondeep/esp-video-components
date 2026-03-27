@@ -31,15 +31,33 @@ menu "Example Configuration"
             help
                 LAN IP (or hostname) of the machine running the ingest server.
 
+        config EXAMPLE_NAGARE_USE_TLS
+            bool "Enable TLS for nagare server (via nginx proxy)"
+            depends on EXAMPLE_SERVER_TYPE_NAGARE
+            default n
+            help
+                Connect to nagare via HTTPS instead of plain HTTP.
+
+                Requires a running nginx TLS proxy in front of nagare.
+                Start it with:  docker compose --profile tls up
+
+                Steps to set up:
+                  1. cd docker/certs && ./gen_cert.sh <LAN_IP>
+                  2. cp docker/certs/server.crt main/certs/nagare_server_ca.pem
+                  3. docker compose --profile tls up
+                  4. Enable this option and set port to 8443.
+
         config EXAMPLE_SERVER_PORT
             int "Server port"
+            default 8443 if EXAMPLE_SERVER_TYPE_NAGARE && EXAMPLE_NAGARE_USE_TLS
             default 8080 if EXAMPLE_SERVER_TYPE_NAGARE
             default 1234
             range 1 65535
             help
                 Port the ingest server is listening on.
-                  Matter default : 1234 (HTTPS)
-                  Nagare default : 8080 (HTTP)
+                  Matter default      : 1234 (HTTPS)
+                  Nagare plain HTTP   : 8080
+                  Nagare with TLS     : 8443 (nginx proxy)
 
         config EXAMPLE_TRACK_NAME
             string "CMAF track name"
