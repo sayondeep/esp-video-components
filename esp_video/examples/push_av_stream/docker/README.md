@@ -36,12 +36,26 @@ The session name (`video1_1743042000`) is `{track}_{unix_timestamp}` — unique
 per ESP32 boot, so restarting the ESP32 never overwrites previous recordings.
 
 ```bash
-# Live playback
+# DASH live playback
 ffplay "http://192.168.0.111:8080/dash/video1_1743042000.str/manifest.mpd"
+
+# HLS live playback (requires EXAMPLE_ENABLE_HLS=y in menuconfig)
+ffplay "http://192.168.0.111:8080/dash/video1_1743042000.str/master.m3u8"
+vlc    "http://192.168.0.111:8080/dash/video1_1743042000.str/master.m3u8"
 
 # Or open in dash.js reference player
 # https://reference.dashif.org/dash.js/
 ```
+
+### Enable HLS (optional)
+
+Enable `Example Configuration → Ingest Server → Also generate HLS playlist` in
+menuconfig.  The adapter then PUTs two additional files alongside the DASH MPD:
+
+- `master.m3u8` — HLS master playlist (points to the track sub-directory)
+- `{track}/playlist.m3u8` — live media playlist, updated after every segment
+
+The same fMP4 segments are reused; no extra data is uploaded.
 
 ### Play back a recording
 
@@ -111,12 +125,15 @@ Rebuild — CMakeLists automatically embeds `nagare_server_ca.pem`.
 ### 5. Playback over HTTPS
 
 ```bash
-# ffplay (accept self-signed cert)
+# DASH (accept self-signed cert)
 ffplay -tls_verify 0 "https://192.168.0.111:8443/dash/video1_1743042000.str/manifest.mpd"
 
-# Or supply the CA cert
+# DASH (supply the CA cert)
 ffplay --tls-ca-file certs/server.crt \
        "https://192.168.0.111:8443/dash/video1_1743042000.str/manifest.mpd"
+
+# HLS over HTTPS (requires EXAMPLE_ENABLE_HLS=y)
+ffplay -tls_verify 0 "https://192.168.0.111:8443/dash/video1_1743042000.str/master.m3u8"
 ```
 
 ---

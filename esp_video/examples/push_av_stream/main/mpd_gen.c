@@ -75,13 +75,11 @@
          "     type=\"dynamic\"\n"
          "     profiles=\"urn:mpeg:dash:profile:isoff-live:2011,"
                "urn:mpeg:cmaf:2019\"\n"
-         "     minBufferTime=\"PT1S\"\n"
-         "     suggestedPresentationDelay=\"PT2S\"\n"
+         "     minBufferTime=\"PT2S\"\n"
+         "     suggestedPresentationDelay=\"PT4S\"\n"
          "     timeShiftBufferDepth=\"PT30S\"\n"
          "     availabilityStartTime=\"%s\"\n"
          "     minimumUpdatePeriod=\"PT%.1fS\">\n"
-         "  <UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:direct:2014\"\n"
-         "             value=\"%s\"/>\n"
          "  <Period id=\"1\" start=\"PT0S\">\n"
          "    <AdaptationSet id=\"1\"\n"
          "                   mimeType=\"video/mp4\"\n"
@@ -101,7 +99,6 @@
          "</MPD>\n",
          ast_str,
          min_update_sec,
-         ast_str,  /* UTCTiming value = same wall-clock time as AST */
          p->codecs,
          p->width, p->height, p->framerate,
          p->timescale,

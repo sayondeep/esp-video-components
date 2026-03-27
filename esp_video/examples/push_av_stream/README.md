@@ -19,16 +19,24 @@ Two server backends are supported:
 ESP32-P4                                    ingest server
    |                                              |
    |-- PUT .../manifest.mpd (type="dynamic") ---->|  open session
+   |-- PUT .../master.m3u8 (HLS, optional) ------>|  HLS master playlist
    |-- PUT .../video1/video1.init --------------->|  ftyp + moov
    |-- PUT .../video1/segment_1001.m4s ---------->|  styp + moof + mdat
+   |-- PUT .../video1/playlist.m3u8 (HLS) ------->|  live media playlist (updated per segment)
    |-- PUT .../video1/segment_1002.m4s ---------->|
+   |-- PUT .../video1/playlist.m3u8 (HLS) ------->|
    |   …                                          |
+   |-- PUT .../video1/playlist.m3u8 (HLS final) ->|  with #EXT-X-ENDLIST
    |-- PUT .../manifest.mpd (type="static") ----->|  close session
 ```
 
 Segment paths are relative to the MPD location.  Each new ESP32 boot writes to
 a uniquely-named session directory (`{track}_{unix_timestamp}.str/`) so
 sessions never collide.
+
+HLS playlists (`master.m3u8` + `playlist.m3u8`) reference the **same fMP4
+segments** as the DASH MPD — no extra data is uploaded.  HLS output is an
+opt-in Kconfig option (`EXAMPLE_ENABLE_HLS`), disabled by default.
 
 ---
 
@@ -66,13 +74,20 @@ The ESP32 log prints the session URL at startup:
 I nagare_adapter: stream ready  MPD → http://192.168.0.111:8080/dash/video1_1743042000.str/manifest.mpd
 ```
 
-Play it with ffplay:
+Play it with ffplay (DASH):
 
 ```bash
 ffplay "http://192.168.0.111:8080/dash/video1_1743042000.str/manifest.mpd"
 ```
 
 Or open the URL in [dash.js reference player](https://reference.dashif.org/dash.js/).
+
+If `EXAMPLE_ENABLE_HLS` is enabled, an HLS stream is published alongside DASH:
+
+```bash
+ffplay "http://192.168.0.111:8080/dash/video1_1743042000.str/master.m3u8"
+vlc    "http://192.168.0.111:8080/dash/video1_1743042000.str/master.m3u8"
+```
 
 ### 5. Play back a recording
 
@@ -215,6 +230,7 @@ what each certificate file is for.
 |--------|---------|-------------|
 | `EXAMPLE_SERVER_TYPE` | Matter | `MATTER` or `NAGARE` |
 | `EXAMPLE_NAGARE_USE_TLS` | n | Enable HTTPS for nagare (nginx proxy required) |
+| `EXAMPLE_ENABLE_HLS` | n | Also generate HLS playlists alongside DASH (nagare only) |
 | `EXAMPLE_SERVER_HOST` | `192.168.1.100` | Server IP / hostname |
 | `EXAMPLE_SERVER_PORT` | 1234 / 8080 / 8443 | Auto-defaults by server+TLS choice |
 | `EXAMPLE_TRACK_NAME` | `video1` | CMAF track name; used in URLs |
@@ -246,6 +262,7 @@ push_av_stream/
 │   ├── push_av_stream_main.c        Application entry point; camera + encode + upload loop
 │   ├── cmaf_mux.c / .h              ISO BMFF fMP4 muxer (init segment + media segments)
 │   ├── mpd_gen.c / .h               DASH MPD XML generator (dynamic + static)
+│   ├── hls_gen.c / .h               HLS m3u8 playlist generator (master + media)
 │   ├── ingest_transport.c / .h      Server-agnostic upload interface
 │   ├── ingest_adapters/
 │   │   ├── nagare_adapter.c         Adapter for nagare-media/ingest (HTTP/HTTPS)

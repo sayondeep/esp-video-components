@@ -20,6 +20,9 @@
 #include "esp_http_client.h"
 #include "sdkconfig.h"
 #include "ingest_transport.h"
+#if CONFIG_EXAMPLE_ENABLE_HLS
+#include "hls_gen.h"
+#endif
 
 static const char *TAG = "matter_adapter";
 
@@ -31,6 +34,13 @@ static const char *TAG = "matter_adapter";
 
 /* First segment number as required by the Matter/CMAF spec. */
 #define MATTER_FIRST_SEGMENT_NUMBER  1001
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+/* Live sliding-window depth — matches DASH timeShiftBufferDepth of 30 s. */
+#define HLS_WINDOW_SIZE        30
+/* Stack buffer: ~200 B header + 30 entries × ~45 B each. */
+#define HLS_PLAYLIST_BUF_LEN  2048
+#endif
 
 /* =========================================================================
  * Matter-specific context
@@ -53,6 +63,19 @@ struct matter_ctx {
     int      stream_id;       /**< Assigned by POST /streams */
     uint32_t session_number;  /**< Increments with each session */
     uint16_t segment_number;  /**< Starts at MATTER_FIRST_SEGMENT_NUMBER */
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    /* HLS live sliding-window ring buffer (same design as nagare_adapter). */
+    uint32_t hls_window[HLS_WINDOW_SIZE];
+    uint32_t hls_window_head;
+    uint32_t hls_window_count;
+    uint32_t hls_dropped_count;
+    float    hls_seg_sec;
+    uint32_t hls_seg_duration_ticks; /**< Ticks per segment (MPD duration attr).
+                                       *   Used to reconstruct $Time$ IDs in the
+                                       *   complete VOD final playlist. */
+    uint32_t hls_bandwidth;
+#endif
 };
 
 
@@ -174,6 +197,145 @@ static esp_err_t do_request(esp_http_client_handle_t http,
 }
 
 /* =========================================================================
+ * HLS helpers (compiled only when CONFIG_EXAMPLE_ENABLE_HLS)
+ * ========================================================================= */
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+
+/* Scan for attr="<uint32>" in an XML string; return fallback if not found. */
+static uint32_t mpd_parse_attr_u32(const char *xml, const char *attr,
+                                    uint32_t fallback)
+{
+    char token[64];
+    snprintf(token, sizeof(token), "%s=\"", attr);
+    const char *p = strstr(xml, token);
+    if (!p) {
+        return fallback;
+    }
+    p += strlen(token);
+    uint32_t val = 0;
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10 + (uint32_t)(*p - '0');
+        p++;
+    }
+    return val;
+}
+
+/* Build and PUT the HLS media playlist for the current live window.
+ * is_final=true appends #EXT-X-ENDLIST (used at session end). */
+static void matter_hls_put_playlist(struct matter_ctx *ctx, bool is_final)
+{
+    if (ctx->hls_window_count == 0) {
+        return;
+    }
+
+    uint32_t ordered[HLS_WINDOW_SIZE];
+    for (uint32_t i = 0; i < ctx->hls_window_count; i++) {
+        ordered[i] = ctx->hls_window[
+            (ctx->hls_window_head + i) % HLS_WINDOW_SIZE];
+    }
+
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    uint32_t media_seq = ctx->hls_dropped_count;
+#else
+    uint32_t media_seq = ordered[0];
+#endif
+
+    hls_media_params_t mp = {
+        .track_name     = ctx->track_name,
+        .media_sequence = media_seq,
+        .seg_duration_s = ctx->hls_seg_sec,
+        .seg_ids        = ordered,
+        .num_segs       = ctx->hls_window_count,
+        .is_final       = is_final,
+    };
+
+    char   buf[HLS_PLAYLIST_BUF_LEN];
+    size_t len;
+    if (hls_gen_media(buf, sizeof(buf), &mp, &len) != ESP_OK) {
+        ESP_LOGW(TAG, "hls_gen_media failed");
+        return;
+    }
+
+    char url[URL_BUF_LEN];
+    snprintf(url, sizeof(url),
+             "https://%s:%d/streams/%d/session_%"PRIu32"/%s/playlist.m3u8",
+             ctx->server_host, ctx->server_port,
+             ctx->stream_id, ctx->session_number, ctx->track_name);
+
+    do_request(ctx->http, HTTP_METHOD_PUT, url,
+               buf, len, "application/vnd.apple.mpegurl",
+               NULL, 0, NULL);
+}
+
+/* Build and PUT a complete VOD HLS media playlist covering every segment
+ * uploaded in this session, then append #EXT-X-ENDLIST.
+ * Falls back to the ring-buffer approach if heap allocation fails. */
+static void matter_hls_put_complete_final_playlist(struct matter_ctx *ctx)
+{
+    uint32_t total = (uint32_t)(ctx->segment_number - MATTER_FIRST_SEGMENT_NUMBER);
+    if (total == 0) {
+        return;
+    }
+
+    uint32_t target_dur = (uint32_t)ctx->hls_seg_sec;
+    if ((float)target_dur < ctx->hls_seg_sec) target_dur++;
+    if (target_dur == 0) target_dur = 1;
+
+    size_t buf_size = 256 + (size_t)total * 45;
+    char  *buf      = malloc(buf_size);
+    if (!buf) {
+        ESP_LOGW(TAG, "HLS final playlist malloc(%zu) failed; using window", buf_size);
+        matter_hls_put_playlist(ctx, true);
+        return;
+    }
+
+    int n = snprintf(buf, buf_size,
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:7\n"
+        "#EXT-X-INDEPENDENT-SEGMENTS\n"
+        "#EXT-X-TARGETDURATION:%"PRIu32"\n"
+        "#EXT-X-MEDIA-SEQUENCE:%"PRIu32"\n"
+        "#EXT-X-MAP:URI=\"%s.init\"\n",
+        target_dur,
+        (uint32_t)MATTER_FIRST_SEGMENT_NUMBER,
+        ctx->track_name);
+    size_t pos = (n > 0) ? (size_t)n : 0;
+
+    for (uint32_t i = 0; i < total && pos < buf_size - 1; i++) {
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+        uint32_t seg_id = i * ctx->hls_seg_duration_ticks;
+#else
+        uint32_t seg_id = MATTER_FIRST_SEGMENT_NUMBER + i;
+#endif
+        int seg_n = snprintf(buf + pos, buf_size - pos,
+            "#EXTINF:%.3f,\n"
+            "segment_%"PRIu32".m4s\n",
+            (double)ctx->hls_seg_sec, seg_id);
+        if (seg_n > 0) pos += (size_t)seg_n;
+    }
+
+    if (pos < buf_size) {
+        int end_n = snprintf(buf + pos, buf_size - pos, "#EXT-X-ENDLIST\n");
+        if (end_n > 0) pos += (size_t)end_n;
+    }
+
+    char url[URL_BUF_LEN];
+    snprintf(url, sizeof(url),
+             "https://%s:%d/streams/%d/session_%"PRIu32"/%s/playlist.m3u8",
+             ctx->server_host, ctx->server_port,
+             ctx->stream_id, ctx->session_number, ctx->track_name);
+    ESP_LOGI(TAG, "PUT HLS final playlist (%"PRIu32" segs, %zu B) → %s",
+             total, pos, url);
+    do_request(ctx->http, HTTP_METHOD_PUT, url,
+               buf, pos, "application/vnd.apple.mpegurl",
+               NULL, 0, NULL);
+    free(buf);
+}
+
+#endif /* CONFIG_EXAMPLE_ENABLE_HLS */
+
+/* =========================================================================
  * Internal Implementation Helpers
  * ========================================================================= */
 
@@ -223,9 +385,47 @@ static esp_err_t matter_start_session_impl(struct matter_ctx *ctx,
              ctx->stream_id, ctx->session_number);
 
     ESP_LOGI(TAG, "PUT dynamic MPD → %s", url);
-    return do_request(ctx->http, HTTP_METHOD_PUT, url,
-                      mpd_xml, mpd_len, "application/dash+xml",
-                      NULL, 0, NULL);
+    esp_err_t err = do_request(ctx->http, HTTP_METHOD_PUT, url,
+                               mpd_xml, mpd_len, "application/dash+xml",
+                               NULL, 0, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    ctx->hls_window_head        = 0;
+    ctx->hls_window_count       = 0;
+    ctx->hls_dropped_count      = 0;
+    ctx->hls_seg_duration_ticks = mpd_parse_attr_u32(mpd_xml, "duration",  90000);
+    uint32_t timescale          = mpd_parse_attr_u32(mpd_xml, "timescale", 90000);
+    ctx->hls_seg_sec = timescale
+        ? (float)ctx->hls_seg_duration_ticks / (float)timescale
+        : 1.0f;
+    if (ctx->hls_seg_sec <= 0.0f) {
+        ctx->hls_seg_sec = 1.0f;
+    }
+    ctx->hls_bandwidth = mpd_parse_attr_u32(mpd_xml, "bandwidth", 1000000);
+
+    hls_master_params_t mp = {
+        .track_name = ctx->track_name,
+        .bandwidth  = ctx->hls_bandwidth,
+    };
+    char hls_buf[256];
+    size_t hls_len;
+    if (hls_gen_master(hls_buf, sizeof(hls_buf), &mp, &hls_len) == ESP_OK) {
+        char hls_url[URL_BUF_LEN];
+        snprintf(hls_url, sizeof(hls_url),
+                 "https://%s:%d/streams/%d/session_%"PRIu32"/master.m3u8",
+                 ctx->server_host, ctx->server_port,
+                 ctx->stream_id, ctx->session_number);
+        ESP_LOGI(TAG, "PUT HLS master → %s", hls_url);
+        do_request(ctx->http, HTTP_METHOD_PUT, hls_url,
+                   hls_buf, hls_len, "application/vnd.apple.mpegurl",
+                   NULL, 0, NULL);
+    }
+#endif /* CONFIG_EXAMPLE_ENABLE_HLS */
+
+    return ESP_OK;
 }
 
 static esp_err_t matter_upload_init_segment_impl(struct matter_ctx *ctx,
@@ -278,12 +478,39 @@ static esp_err_t matter_upload_media_segment_impl(struct matter_ctx *ctx,
     if (err == ESP_OK) {
         ctx->segment_number++;
     }
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    if (err == ESP_OK) {
+        /* Push this segment's ID into the HLS live window. */
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+        uint32_t seg_id = presentation_time;
+#else
+        uint32_t seg_id = (uint32_t)(ctx->segment_number - 1); /* already incremented */
+#endif
+        uint32_t head = ctx->hls_window_head;
+        if (ctx->hls_window_count < HLS_WINDOW_SIZE) {
+            ctx->hls_window[(head + ctx->hls_window_count) % HLS_WINDOW_SIZE] = seg_id;
+            ctx->hls_window_count++;
+        } else {
+            ctx->hls_window[head] = seg_id;
+            ctx->hls_window_head  = (head + 1) % HLS_WINDOW_SIZE;
+            ctx->hls_dropped_count++;
+        }
+        matter_hls_put_playlist(ctx, /*is_final=*/false);
+    }
+#endif /* CONFIG_EXAMPLE_ENABLE_HLS */
+
     return err;
 }
 
 static esp_err_t matter_end_session_impl(struct matter_ctx *ctx,
                                           const char *mpd_xml, size_t mpd_len)
 {
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    /* Replace the live sliding-window playlist with a complete VOD playlist. */
+    matter_hls_put_complete_final_playlist(ctx);
+#endif
+
     char url[URL_BUF_LEN];
     snprintf(url, sizeof(url),
              "https://%s:%d/streams/%d/session_%"PRIu32"/index.mpd",

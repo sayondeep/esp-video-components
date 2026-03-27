@@ -765,6 +765,16 @@ class PushAvServer:
 
                 if mpd_type == "static":
                     session.complete = True
+                    # Update the cached MPD tree to the static one.
+                    # The GET handler checks mpd_xml_tree.type: if it is "static"
+                    # (not "dynamic") it skips the live-edge AST adjustment and falls
+                    # through to serve the actual static file from disk.  Without this
+                    # update the player is served the dynamic MPD indefinitely and
+                    # keeps requesting segments beyond the last uploaded one.
+                    sid = str(stream_id)
+                    if sid in self.stream_segment_info:
+                        self.stream_segment_info[sid]['mpd_xml_tree'] = root
+                    log.info(f"Stream {stream_id}: session complete, switching to static MPD")
 
                 path_regex = re.compile(r"^session_\d+/index$")
                 if not path_regex.match(file_path):
@@ -772,14 +782,12 @@ class PushAvServer:
 
                 session.uploaded_manifests.append((file_path_with_ext, file_path_with_ext + ".crt"))
             elif ext == "m3u8":
-                # HLS manifest files
-                if stream.interface != SupportedIngestInterface.hls:
-                    errors.append("Unsupported manifest object extension")
-
+                # HLS manifest files.
+                # Accepted for both HLS and DASH streams: a DASH stream may
+                # additionally PUT HLS playlists so players can use either
+                # protocol against the same set of fMP4 segments.
                 if session is None:
                     session = stream.new_session()
-
-                # TODO Lifecycle validation for HLS manifests
 
                 session.uploaded_manifests.append((file_path_with_ext, file_path_with_ext + ".crt"))
             elif ext == "m4s" or ext == "init":

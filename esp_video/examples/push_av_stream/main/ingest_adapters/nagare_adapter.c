@@ -39,18 +39,29 @@
  *   PUT  .../dash/{stream_name}.str/{track}/segment_NNNN.m4s                → media segments
  *   PUT  .../dash/{stream_name}.str/manifest.mpd                            → static MPD (close)
  *
+ * With CONFIG_EXAMPLE_ENABLE_HLS the adapter also PUTs HLS playlists that
+ * reference the same fMP4 segments (no extra data uploaded):
+ *
+ *   PUT  .../dash/{stream_name}.str/master.m3u8                             → HLS master (once)
+ *   PUT  .../dash/{stream_name}.str/{track}/playlist.m3u8                   → HLS media (per segment)
+ *
  * Playback:
- *   http://{host}:{port}/dash/{stream_name}.str/manifest.mpd
+ *   DASH: http://{host}:{port}/dash/{stream_name}.str/manifest.mpd
+ *   HLS:  http://{host}:{port}/dash/{stream_name}.str/master.m3u8
  */
 
 #include <string.h>
 #include <inttypes.h>
 #include <time.h>
+#include <stdlib.h>
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_http_client.h"
 #include "sdkconfig.h"
 #include "ingest_transport.h"
+#if CONFIG_EXAMPLE_ENABLE_HLS
+#include "hls_gen.h"
+#endif
 
 #if CONFIG_EXAMPLE_NAGARE_USE_TLS
 /* Embedded server CA certificate (main/certs/nagare_server_ca.pem).
@@ -70,6 +81,15 @@ static const char *TAG = "nagare_adapter";
 /* Segment numbering: must match start_number in the MPD (1001 per CMAF/Matter spec) */
 #define NAGARE_FIRST_SEGMENT_NUMBER  1001
 
+#if CONFIG_EXAMPLE_ENABLE_HLS
+/* Live sliding-window depth.  Must be >= 3 × target_duration (HLS spec).
+ * Match the DASH timeShiftBufferDepth of 30 s so both protocols offer the
+ * same rewind range during live playback. */
+#define HLS_WINDOW_SIZE        30
+/* Stack buffer for the live playlist: header (~200 B) + 30 entries × ~45 B. */
+#define HLS_PLAYLIST_BUF_LEN  2048
+#endif
+
 /* -------------------------------------------------------------------------
  * Adapter context
  * ---------------------------------------------------------------------- */
@@ -83,6 +103,26 @@ struct nagare_ctx {
     esp_http_client_handle_t http;
 
     uint16_t segment_number;
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    /* Sliding window ring buffer of the last HLS_WINDOW_SIZE segment IDs.
+     *
+     * hls_window_head  : index of the oldest entry.
+     * hls_window_count : number of valid entries (0 … HLS_WINDOW_SIZE).
+     * hls_dropped_count: how many segments have been evicted from the front;
+     *                    used as EXT-X-MEDIA-SEQUENCE in $Time$ mode.
+     * hls_seg_sec      : segment duration in seconds (parsed from the MPD).
+     * hls_bandwidth    : bitrate in bps (parsed from the MPD). */
+    uint32_t hls_window[HLS_WINDOW_SIZE];
+    uint32_t hls_window_head;
+    uint32_t hls_window_count;
+    uint32_t hls_dropped_count;
+    float    hls_seg_sec;
+    uint32_t hls_seg_duration_ticks; /**< duration in timescale ticks (= MPD duration attr).
+                                      *   Used to reconstruct $Time$ segment IDs for the
+                                      *   complete VOD final playlist. */
+    uint32_t hls_bandwidth;
+#endif
 };
 
 struct ingest_transport_ctx {
@@ -153,6 +193,163 @@ static esp_err_t do_request(esp_http_client_handle_t http,
 }
 
 /* -------------------------------------------------------------------------
+ * HLS helpers (compiled only when CONFIG_EXAMPLE_ENABLE_HLS)
+ * ---------------------------------------------------------------------- */
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+
+/* Scan for an XML attribute of the form  attr="<uint32>"  in mpd_xml.
+ * Returns fallback if the attribute is not found. */
+static uint32_t mpd_parse_attr_u32(const char *xml,
+                                    const char *attr,
+                                    uint32_t    fallback)
+{
+    char token[64];
+    snprintf(token, sizeof(token), "%s=\"", attr);
+    const char *p = strstr(xml, token);
+    if (!p) {
+        return fallback;
+    }
+    p += strlen(token);
+    uint32_t val = 0;
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10 + (uint32_t)(*p - '0');
+        p++;
+    }
+    return val;
+}
+
+/* Build and PUT the HLS media playlist for the current window.
+ * is_final=true appends #EXT-X-ENDLIST (used when the session ends). */
+static void nagare_hls_put_playlist(struct nagare_ctx *ctx, bool is_final)
+{
+    if (ctx->hls_window_count == 0) {
+        return;
+    }
+
+    /* Expand ring buffer into a linear ordered array (oldest first). */
+    uint32_t ordered[HLS_WINDOW_SIZE];
+    for (uint32_t i = 0; i < ctx->hls_window_count; i++) {
+        ordered[i] = ctx->hls_window[
+            (ctx->hls_window_head + i) % HLS_WINDOW_SIZE];
+    }
+
+    /* EXT-X-MEDIA-SEQUENCE:
+     *   $Number$ mode — sequence number of the first segment in the window.
+     *   $Time$   mode — ordinal count of segments evicted from the front. */
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    uint32_t media_seq = ctx->hls_dropped_count;
+#else
+    uint32_t media_seq = ordered[0];
+#endif
+
+    hls_media_params_t mp = {
+        .track_name     = ctx->track_name,
+        .media_sequence = media_seq,
+        .seg_duration_s = ctx->hls_seg_sec,
+        .seg_ids        = ordered,
+        .num_segs       = ctx->hls_window_count,
+        .is_final       = is_final,
+    };
+
+    char   buf[HLS_PLAYLIST_BUF_LEN];
+    size_t len;
+    if (hls_gen_media(buf, sizeof(buf), &mp, &len) != ESP_OK) {
+        ESP_LOGW(TAG, "hls_gen_media failed");
+        return;
+    }
+
+    char url[URL_BUF_LEN];
+    snprintf(url, sizeof(url),
+             NAGARE_SCHEME "://%s:%d/dash/%s.str/%s/playlist.m3u8",
+             ctx->host, ctx->port, ctx->stream_name, ctx->track_name);
+
+    do_request(ctx->http, HTTP_METHOD_PUT, url,
+               buf, len, "application/vnd.apple.mpegurl",
+               NULL, 0, NULL);
+}
+
+/* Build and PUT a complete VOD HLS media playlist covering every segment
+ * uploaded in this session, then append #EXT-X-ENDLIST.
+ *
+ * Unlike the live playlist which only keeps the last HLS_WINDOW_SIZE segments,
+ * this function reconstructs the full segment list from the known start ID and
+ * the total segment count.  Used only when the session ends.
+ *
+ * $Number$ mode: IDs are NAGARE_FIRST_SEGMENT_NUMBER, +1, +2 …
+ * $Time$   mode: IDs are 0, hls_seg_duration_ticks, 2×hls_seg_duration_ticks …
+ *                (segment 0 always starts at decode-time 0).
+ *
+ * Falls back to the ring-buffer approach if heap allocation fails. */
+static void nagare_hls_put_complete_final_playlist(struct nagare_ctx *ctx)
+{
+    uint32_t total = (uint32_t)(ctx->segment_number - NAGARE_FIRST_SEGMENT_NUMBER);
+    if (total == 0) {
+        return;
+    }
+
+    uint32_t target_dur = (uint32_t)ctx->hls_seg_sec;
+    if ((float)target_dur < ctx->hls_seg_sec) target_dur++;
+    if (target_dur == 0) target_dur = 1;
+
+    /* Heap-allocate: ~220 B header + ~45 B per segment + 20 B footer. */
+    size_t buf_size = 256 + (size_t)total * 45;
+    char  *buf      = malloc(buf_size);
+    if (!buf) {
+        ESP_LOGW(TAG, "HLS final playlist malloc(%zu) failed; using window", buf_size);
+        nagare_hls_put_playlist(ctx, true);
+        return;
+    }
+
+    /* Header */
+    int n = snprintf(buf, buf_size,
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:7\n"
+        "#EXT-X-INDEPENDENT-SEGMENTS\n"
+        "#EXT-X-TARGETDURATION:%"PRIu32"\n"
+        "#EXT-X-MEDIA-SEQUENCE:%"PRIu32"\n"
+        "#EXT-X-MAP:URI=\"%s.init\"\n",
+        target_dur,
+        (uint32_t)NAGARE_FIRST_SEGMENT_NUMBER,
+        ctx->track_name);
+    size_t pos = (n > 0) ? (size_t)n : 0;
+
+    /* One EXTINF + segment URI per uploaded segment */
+    for (uint32_t i = 0; i < total && pos < buf_size - 1; i++) {
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+        uint32_t seg_id = i * ctx->hls_seg_duration_ticks;
+#else
+        uint32_t seg_id = NAGARE_FIRST_SEGMENT_NUMBER + i;
+#endif
+        int seg_n = snprintf(buf + pos, buf_size - pos,
+            "#EXTINF:%.3f,\n"
+            "segment_%"PRIu32".m4s\n",
+            (double)ctx->hls_seg_sec,
+            seg_id);
+        if (seg_n > 0) pos += (size_t)seg_n;
+    }
+
+    /* End-of-stream marker */
+    if (pos < buf_size) {
+        int end_n = snprintf(buf + pos, buf_size - pos, "#EXT-X-ENDLIST\n");
+        if (end_n > 0) pos += (size_t)end_n;
+    }
+
+    char url[URL_BUF_LEN];
+    snprintf(url, sizeof(url),
+             NAGARE_SCHEME "://%s:%d/dash/%s.str/%s/playlist.m3u8",
+             ctx->host, ctx->port, ctx->stream_name, ctx->track_name);
+    ESP_LOGI(TAG, "PUT HLS final playlist (%"PRIu32" segs, %zu B) → %s",
+             total, pos, url);
+    do_request(ctx->http, HTTP_METHOD_PUT, url,
+               buf, pos, "application/vnd.apple.mpegurl",
+               NULL, 0, NULL);
+    free(buf);
+}
+
+#endif /* CONFIG_EXAMPLE_ENABLE_HLS */
+
+/* -------------------------------------------------------------------------
  * Protocol helpers
  *
  * Nagare uses a flat file-PUT model: there is no stream-creation handshake.
@@ -181,9 +378,48 @@ static esp_err_t nagare_start_session_impl(struct nagare_ctx *ctx,
              ctx->host, ctx->port, ctx->stream_name);
 
     ESP_LOGI(TAG, "PUT dynamic MPD → %s", url);
-    return do_request(ctx->http, HTTP_METHOD_PUT, url,
-                      mpd_xml, mpd_len, "application/dash+xml",
-                      NULL, 0, NULL);
+    esp_err_t err = do_request(ctx->http, HTTP_METHOD_PUT, url,
+                               mpd_xml, mpd_len, "application/dash+xml",
+                               NULL, 0, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    /* Reset the live window and parse stream parameters from the MPD. */
+    ctx->hls_window_head   = 0;
+    ctx->hls_window_count  = 0;
+    ctx->hls_dropped_count = 0;
+    ctx->hls_seg_duration_ticks = mpd_parse_attr_u32(mpd_xml, "duration",  90000);
+    uint32_t timescale          = mpd_parse_attr_u32(mpd_xml, "timescale", 90000);
+    ctx->hls_seg_sec = timescale
+        ? (float)ctx->hls_seg_duration_ticks / (float)timescale
+        : 1.0f;
+    if (ctx->hls_seg_sec <= 0.0f) {
+        ctx->hls_seg_sec = 1.0f;
+    }
+    ctx->hls_bandwidth = mpd_parse_attr_u32(mpd_xml, "bandwidth", 1000000);
+
+    /* PUT the HLS master playlist (points to {track}/playlist.m3u8). */
+    hls_master_params_t mp = {
+        .track_name = ctx->track_name,
+        .bandwidth  = ctx->hls_bandwidth,
+    };
+    char hls_buf[256];
+    size_t hls_len;
+    if (hls_gen_master(hls_buf, sizeof(hls_buf), &mp, &hls_len) == ESP_OK) {
+        char hls_url[URL_BUF_LEN];
+        snprintf(hls_url, sizeof(hls_url),
+                 NAGARE_SCHEME "://%s:%d/dash/%s.str/master.m3u8",
+                 ctx->host, ctx->port, ctx->stream_name);
+        ESP_LOGI(TAG, "PUT HLS master → %s", hls_url);
+        do_request(ctx->http, HTTP_METHOD_PUT, hls_url,
+                   hls_buf, hls_len, "application/vnd.apple.mpegurl",
+                   NULL, 0, NULL);
+    }
+#endif /* CONFIG_EXAMPLE_ENABLE_HLS */
+
+    return ESP_OK;
 }
 
 static esp_err_t nagare_upload_init_impl(struct nagare_ctx *ctx,
@@ -218,18 +454,56 @@ static esp_err_t nagare_upload_segment_impl(struct nagare_ctx *ctx,
     (void)presentation_time;
 #endif
 
+    /* Save the segment ID before incrementing the counter ($Number$ mode). */
+#if CONFIG_EXAMPLE_ENABLE_HLS && !CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    uint32_t uploaded_seg_number = ctx->segment_number;
+#endif
+
     esp_err_t err = do_request(ctx->http, HTTP_METHOD_PUT, url,
                                 data, size, "video/iso.segment",
                                 NULL, 0, NULL);
-    if (err == ESP_OK) {
-        ctx->segment_number++;
+    if (err != ESP_OK) {
+        return err;
     }
-    return err;
+    ctx->segment_number++;
+
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    /* Push the segment ID into the ring buffer.
+     * When the window is full, the oldest entry is overwritten and
+     * hls_dropped_count is incremented (used as EXT-X-MEDIA-SEQUENCE). */
+#if CONFIG_EXAMPLE_SEGMENT_NAMING_TIMESTAMP
+    uint32_t seg_id = presentation_time;
+#else
+    uint32_t seg_id = uploaded_seg_number;
+#endif
+
+    uint32_t head = ctx->hls_window_head;
+    if (ctx->hls_window_count < HLS_WINDOW_SIZE) {
+        ctx->hls_window[(head + ctx->hls_window_count) % HLS_WINDOW_SIZE] = seg_id;
+        ctx->hls_window_count++;
+    } else {
+        /* Overwrite oldest slot and advance the head pointer. */
+        ctx->hls_window[head] = seg_id;
+        ctx->hls_window_head  = (head + 1) % HLS_WINDOW_SIZE;
+        ctx->hls_dropped_count++;
+    }
+
+    nagare_hls_put_playlist(ctx, /*is_final=*/false);
+#endif /* CONFIG_EXAMPLE_ENABLE_HLS */
+
+    return ESP_OK;
 }
 
 static esp_err_t nagare_end_session_impl(struct nagare_ctx *ctx,
                                           const char *mpd_xml, size_t mpd_len)
 {
+#if CONFIG_EXAMPLE_ENABLE_HLS
+    /* PUT a complete final playlist (all segments + EXT-X-ENDLIST) before
+     * sending the static DASH MPD.  This replaces the live sliding-window
+     * playlist with a seekable full-length VOD playlist. */
+    nagare_hls_put_complete_final_playlist(ctx);
+#endif
+
     char url[URL_BUF_LEN];
     snprintf(url, sizeof(url),
              NAGARE_SCHEME "://%s:%d/dash/%s.str/manifest.mpd",

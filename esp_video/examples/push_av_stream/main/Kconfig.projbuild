@@ -69,7 +69,27 @@ menu "Example Configuration"
                 Used in ingest / playback URLs:
                   PUT /dash/<track>.str/<track>/<track>.init
                   PUT /dash/<track>.str/<track>/segment_NNNN.m4s
-                  GET /dash/<track>.str/manifest.mpd  (playback)
+                  GET /dash/<track>.str/manifest.mpd   (DASH playback)
+                  GET /dash/<track>.str/master.m3u8    (HLS playback, if enabled)
+
+        config EXAMPLE_ENABLE_HLS
+            bool "Also generate HLS playlist (alongside DASH MPD)"
+            depends on EXAMPLE_SERVER_TYPE_NAGARE || EXAMPLE_SERVER_TYPE_MATTER
+            default n
+            help
+                Generates HLS master + media playlists in addition to the DASH MPD.
+                The same fMP4 segments are reused for both protocols, so no extra
+                data is uploaded to the server.
+
+                For nagare-media/ingest:
+                  master.m3u8   – http://{host}:{port}/dash/{track}_{ts}.str/master.m3u8
+                  playlist.m3u8 – …/{track}/playlist.m3u8  (updated after every segment)
+                  Play: ffplay "http://<HOST>:8080/dash/<track>_<ts>.str/master.m3u8"
+
+                For Matter push_av_server:
+                  master.m3u8   – https://{host}:{port}/streams/{id}/session_{N}/master.m3u8
+                  playlist.m3u8 – …/{track}/playlist.m3u8  (updated after every segment)
+                  Play: ffplay "https://<HOST>:1234/streams/<id>/session_1/master.m3u8"
 
     endmenu
 

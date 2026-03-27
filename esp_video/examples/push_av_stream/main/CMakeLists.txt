@@ -7,6 +7,10 @@ set(srcs
     "ingest_adapters/nagare_adapter.c"
 )
 
+if(CONFIG_EXAMPLE_ENABLE_HLS)
+    list(APPEND srcs "hls_gen.c")
+endif()
+
 # Embed TLS certificate files based on the selected server backend and TLS options.
 #
 # Matter backend:  always uses HTTPS; optionally mTLS with client cert+key.

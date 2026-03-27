@@ -880,17 +880,29 @@ static void push_av_stream_task(void *arg)
     /* ------------------------------------------------------------------ */
     /* 10. Upload static MPD → close session                               */
     /* ------------------------------------------------------------------ */
-    /* Calculate duration from actual segments uploaded, not wall-clock time.
-     * Each segment is SEGMENT_DURATION_TICKS / VIDEO_TIMESCALE seconds.
-     * For 30 fps and 30 frames/segment: 90000 ticks / 90000 Hz = 1 second/segment */
-    uint32_t total_sec = ctx->total_segments * (SEGMENT_DURATION_TICKS / VIDEO_TIMESCALE);
-    if (total_sec == 0) total_sec = 1;
-
-    ret = mpd_gen_static(mpd_buf, sizeof(mpd_buf), &mpd_p, total_sec, &mpd_len);
-    if (ret == ESP_OK && ctx->http_mutex) {
-        /* Take mutex before using HTTP client for static MPD upload */
+    /* total_sec MUST be read while holding http_mutex.
+     *
+     * Race without the mutex:
+     *   upload_task  dequeues last segment → takes mutex → uploads → gives mutex
+     *                                                              → total_segments++
+     *   main_task    reads total_segments (possibly BEFORE the ++)
+     *                → takes mutex (upload done, mutex free)
+     *                → sends static MPD with an under-counted duration
+     *
+     * By reading total_segments only after acquiring the mutex we guarantee
+     * that any in-flight segment upload has both completed AND incremented
+     * the counter before we generate the static MPD. */
+    uint32_t total_sec = 1;
+    if (ctx->http_mutex) {
         if (xSemaphoreTake(ctx->http_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
-            ingest_transport_end_session(ctx->transport, mpd_buf, mpd_len);
+            /* The upload task has finished all segments at this point. */
+            total_sec = ctx->total_segments * (SEGMENT_DURATION_TICKS / VIDEO_TIMESCALE);
+            if (total_sec == 0) total_sec = 1;
+
+            ret = mpd_gen_static(mpd_buf, sizeof(mpd_buf), &mpd_p, total_sec, &mpd_len);
+            if (ret == ESP_OK) {
+                ingest_transport_end_session(ctx->transport, mpd_buf, mpd_len);
+            }
             xSemaphoreGive(ctx->http_mutex);
         } else {
             ESP_LOGW(TAG, "Timeout waiting for HTTP mutex to upload static MPD");
